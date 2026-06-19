@@ -1,4 +1,4 @@
-# KABLAM :explosion:
+# KABLAM :collision:
 
 _Kanban goes boom_
 
