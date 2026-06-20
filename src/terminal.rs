@@ -9,43 +9,42 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Widget, Wrap};
 
 use crate::command_palette::CommandPaletteView;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TranscriptEntry {
-    User(String),
+pub enum HistoryEntry {
     Assistant {
         model_id: String,
+        prompt: String,
         content: String,
         callouts: Vec<String>,
         status: Option<AssistantStatus>,
     },
-    System {
-        content: String,
-        status: Option<SystemStatus>,
+    LoadingModel {
+        model_id: String,
+        status: Option<ModelLoadStatus>,
     },
+    Command {
+        raw: String,
+        result: String,
+    },
+    Break,
+    SystemNotice(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelLoadStatus {
+    Loading { started_at: Instant },
+    Loaded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantStatus {
-    Loading {
-        started_at: Instant,
-    },
-    #[allow(dead_code)]
-    Loaded,
-    Generating {
-        started_at: Instant,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SystemStatus {
-    Loading {
-        model_id: String,
-        started_at: Instant,
-    },
+    Queued { started_at: Instant },
+    Loading { started_at: Instant },
+    Generating { started_at: Instant },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +52,7 @@ pub enum Mode {
     Insert,
     Normal,
     Command,
+    ConfirmDelete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,14 +61,22 @@ pub enum ScrollAnchor {
     Bottom,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabRenderInfo {
+    pub label: String,
+}
+
 pub struct RenderState<'a> {
-    pub entries: &'a [TranscriptEntry],
+    pub entries: &'a [HistoryEntry],
     pub selected_chat_entry: Option<usize>,
     pub mode: Mode,
     pub draft: &'a str,
     pub prompt_inline: bool,
     pub scroll_anchor: ScrollAnchor,
     pub command_palette: Option<CommandPaletteView<'a>>,
+    pub tabs: &'a [TabRenderInfo],
+    pub active_tab: usize,
+    pub delete_confirmation: Option<&'a str>,
 }
 
 pub struct TerminalUi {
@@ -100,18 +108,7 @@ impl TerminalUi {
             .draw(|frame| {
                 let area = frame.area();
                 frame.render_widget(Clear, area);
-                render_screen(
-                    frame,
-                    area,
-                    &mut self.history_scroll,
-                    state.entries,
-                    state.selected_chat_entry,
-                    state.mode,
-                    state.draft,
-                    state.prompt_inline,
-                    state.scroll_anchor,
-                    state.command_palette,
-                );
+                render_screen(frame, area, &mut self.history_scroll, state);
             })
             .map(|_| ())
             .map_err(|err| io::Error::other(err.to_string()))
@@ -139,29 +136,38 @@ impl Drop for MouseCaptureGuard {
     }
 }
 
-pub fn chat_entry_positions(entries: &[TranscriptEntry]) -> Vec<usize> {
+pub fn chat_entry_positions(entries: &[HistoryEntry]) -> Vec<usize> {
     entries.iter().enumerate().map(|(index, _)| index).collect()
 }
 
-pub fn clipboard_text(entry: &TranscriptEntry) -> String {
-    match entry {
-        TranscriptEntry::User(content) => format!("user:\n{content}"),
-        TranscriptEntry::Assistant {
-            model_id, content, ..
-        } => format!("assistant {model_id}:\n{content}"),
-        TranscriptEntry::System { content, .. } => format!("system:\n{content}"),
+pub fn clipboard_text(entries: &[HistoryEntry], index: usize) -> String {
+    match entries.get(index) {
+        Some(HistoryEntry::Assistant {
+            model_id,
+            prompt,
+            content,
+            ..
+        }) => format!("assistant {model_id}:\n{prompt}\n\n{content}"),
+        Some(HistoryEntry::LoadingModel { model_id, status }) => match status {
+            Some(ModelLoadStatus::Loading { .. }) => format!("loading model:\n{model_id}"),
+            Some(ModelLoadStatus::Loaded) | None => format!("model loaded:\n{model_id}"),
+        },
+        Some(HistoryEntry::Command { raw, result }) => format!("command:\n{raw}\n\n{result}"),
+        Some(HistoryEntry::Break) => String::from("break"),
+        Some(HistoryEntry::SystemNotice(content)) => format!("system:\n{content}"),
+        None => String::new(),
     }
 }
 
 pub fn selected_transcript_index(
-    entries: &[TranscriptEntry],
+    entries: &[HistoryEntry],
     selected_chat_entry: Option<usize>,
 ) -> Option<usize> {
     let positions = chat_entry_positions(entries);
     selected_chat_entry.and_then(|selected| positions.get(selected).copied())
 }
 
-fn build_model_color_map(entries: &[TranscriptEntry]) -> HashMap<String, Color> {
+fn build_model_color_map(entries: &[HistoryEntry]) -> HashMap<String, Color> {
     const MODEL_COLORS: [Color; 12] = [
         Color::Blue,
         Color::Red,
@@ -181,12 +187,18 @@ fn build_model_color_map(entries: &[TranscriptEntry]) -> HashMap<String, Color> 
     let mut next_color = 0usize;
 
     for entry in entries {
-        if let TranscriptEntry::Assistant { model_id, .. } = entry {
-            if !colors.contains_key(model_id) {
-                let color = MODEL_COLORS[next_color % MODEL_COLORS.len()];
-                colors.insert(model_id.clone(), color);
-                next_color += 1;
+        match entry {
+            HistoryEntry::Assistant { model_id, .. }
+            | HistoryEntry::LoadingModel { model_id, .. } => {
+                if !colors.contains_key(model_id) {
+                    colors.insert(
+                        model_id.clone(),
+                        MODEL_COLORS[next_color % MODEL_COLORS.len()],
+                    );
+                    next_color += 1;
+                }
             }
+            _ => {}
         }
     }
 
@@ -197,28 +209,41 @@ fn render_screen<T: RenderTarget>(
     target: &mut T,
     area: Rect,
     history_scroll: &mut HistoryScrollState,
-    entries: &[TranscriptEntry],
-    selected_chat_entry: Option<usize>,
-    mode: Mode,
-    draft: &str,
-    prompt_inline: bool,
-    scroll_anchor: ScrollAnchor,
-    command_palette: Option<CommandPaletteView<'_>>,
+    state: RenderState<'_>,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
 
-    let prompt_height = match mode {
-        Mode::Insert if !prompt_inline => prompt_box_height(area.height),
+    let tabs_height = 3u16.min(area.height);
+    let after_tabs = Rect::new(
+        area.x,
+        area.y + tabs_height,
+        area.width,
+        area.height.saturating_sub(tabs_height),
+    );
+    render_tabs(
+        target,
+        Rect::new(area.x, area.y, area.width, tabs_height),
+        state.tabs,
+        state.active_tab,
+    );
+
+    let prompt_height = match state.mode {
+        Mode::Insert if !state.prompt_inline => prompt_box_height(after_tabs.height),
         _ => 0,
     };
     let footer_height = prompt_height + 1;
-    let transcript_height = area.height.saturating_sub(footer_height);
+    let transcript_height = after_tabs.height.saturating_sub(footer_height);
 
     if transcript_height > 0 {
-        let model_colors = build_model_color_map(entries);
-        let transcript_area = Rect::new(area.x, area.y, area.width, transcript_height);
+        let model_colors = build_model_color_map(state.entries);
+        let transcript_area = Rect::new(
+            after_tabs.x,
+            after_tabs.y,
+            after_tabs.width,
+            transcript_height,
+        );
         target.render_block(
             Block::default().borders(Borders::ALL).title("history"),
             transcript_area,
@@ -231,26 +256,29 @@ fn render_screen<T: RenderTarget>(
             target,
             transcript_inner,
             history_scroll,
-            entries,
-            selected_chat_entry,
-            mode,
-            draft,
-            prompt_inline,
-            scroll_anchor,
+            state.entries,
+            state.selected_chat_entry,
+            state.mode,
+            state.draft,
+            state.prompt_inline,
+            state.scroll_anchor,
             Some(&model_colors),
         );
     }
 
     let footer_area = Rect::new(
-        area.x,
-        area.y + transcript_height,
-        area.width,
-        area.height.saturating_sub(transcript_height),
+        after_tabs.x,
+        after_tabs.y + transcript_height,
+        after_tabs.width,
+        after_tabs.height.saturating_sub(transcript_height),
     );
-    render_footer(target, footer_area, mode, draft, prompt_inline);
+    render_footer(target, footer_area, state.mode, state.draft, state.prompt_inline);
 
-    if let Some(command_palette) = command_palette {
-        render_command_palette_overlay(target, area, command_palette);
+    if let Some(command_palette) = state.command_palette {
+        render_command_palette_overlay(target, after_tabs, command_palette);
+    }
+    if let Some(text) = state.delete_confirmation {
+        render_floating_message_overlay(target, after_tabs, "confirm", text, false);
     }
 }
 
@@ -258,7 +286,7 @@ fn render_history_viewport(
     target: &mut impl RenderTarget,
     area: Rect,
     history_scroll: &mut HistoryScrollState,
-    entries: &[TranscriptEntry],
+    entries: &[HistoryEntry],
     selected_chat_entry: Option<usize>,
     mode: Mode,
     draft: &str,
@@ -271,8 +299,7 @@ fn render_history_viewport(
     }
 
     let chat_positions = chat_entry_positions(entries);
-    let content_area = transcript_content_area(area);
-    let content_width = content_area.width;
+    let content_width = transcript_content_area(area).width;
     let mut items = Vec::new();
     let mut anchor_index = None;
 
@@ -283,7 +310,7 @@ fn render_history_viewport(
         let selected = chat_position == selected_chat_entry;
         let paragraph_index = items.len();
 
-        if selected && prompt_inline {
+        if selected && prompt_inline && matches!(entry, HistoryEntry::Assistant { .. }) {
             let (prompt_paragraph, height, cursor) =
                 entry.editing_paragraph(draft, content_width, model_colors);
             items.push(RenderItem::Prompt {
@@ -309,23 +336,51 @@ fn render_history_viewport(
     render_scrollbox(
         target,
         area,
-        content_area,
         history_scroll,
         items,
         anchor_index,
-        prompt_inline,
         scroll_anchor,
     );
+}
+
+fn transcript_content_area(area: Rect) -> Rect {
+    let padding = 2;
+    let x = area.x.saturating_add(padding);
+    let width = area.width.saturating_sub(padding * 2);
+    Rect::new(x, area.y, width, area.height)
+}
+
+fn render_tabs(
+    target: &mut impl RenderTarget,
+    area: Rect,
+    tabs: &[TabRenderInfo],
+    active_tab: usize,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let titles = tabs
+        .iter()
+        .map(|tab| Line::from(tab.label.clone()))
+        .collect::<Vec<_>>();
+    let tabs = Tabs::new(titles)
+        .block(Block::default().borders(Borders::ALL).title("threads"))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .select(active_tab.min(tabs.len().saturating_sub(1)));
+    target.render_tabs(tabs, area);
 }
 
 fn render_scrollbox(
     target: &mut impl RenderTarget,
     area: Rect,
-    content_area: Rect,
     history_scroll: &mut HistoryScrollState,
     items: Vec<RenderItem>,
     anchor_index: Option<usize>,
-    _prompt_inline: bool,
     scroll_anchor: ScrollAnchor,
 ) {
     let total_height = items
@@ -334,7 +389,6 @@ fn render_scrollbox(
         .map(usize::from)
         .sum::<usize>();
     let viewport_height = area.height as usize;
-
     if viewport_height == 0 || total_height == 0 {
         history_scroll.offset = 0;
         return;
@@ -342,17 +396,12 @@ fn render_scrollbox(
 
     let max_offset = total_height.saturating_sub(viewport_height);
     history_scroll.offset = history_scroll.offset.min(max_offset);
-
     let item_ranges = item_ranges(&items);
     if let Some(anchor_index) = anchor_index {
         let (anchor_start, anchor_end) = item_ranges[anchor_index];
-        if anchor_start < history_scroll.offset {
-            history_scroll.offset = match scroll_anchor {
-                ScrollAnchor::Top => anchor_start,
-                ScrollAnchor::Bottom => anchor_end.saturating_sub(viewport_height),
-            }
-            .min(max_offset);
-        } else if anchor_end > history_scroll.offset + viewport_height {
+        if anchor_start < history_scroll.offset
+            || anchor_end > history_scroll.offset + viewport_height
+        {
             history_scroll.offset = match scroll_anchor {
                 ScrollAnchor::Top => anchor_start,
                 ScrollAnchor::Bottom => anchor_end.saturating_sub(viewport_height),
@@ -369,6 +418,7 @@ fn render_scrollbox(
         .saturating_sub(viewport_start)
         .min(viewport_height);
     let render_origin_y = area.y + viewport_height.saturating_sub(visible_content_height) as u16;
+
     for (index, item) in items.into_iter().enumerate() {
         let (item_start, item_end) = item_ranges[index];
         if item_end <= viewport_start {
@@ -387,7 +437,6 @@ fn render_scrollbox(
         render_clipped_item(
             target,
             area,
-            content_area,
             item,
             render_y,
             visible_height,
@@ -396,40 +445,27 @@ fn render_scrollbox(
     }
 }
 
-fn item_ranges(items: &[RenderItem]) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::with_capacity(items.len());
-    let mut cursor = 0usize;
-    for item in items {
-        let start = cursor;
-        cursor += item.height() as usize;
-        ranges.push((start, cursor));
-    }
-    ranges
-}
-
 fn render_clipped_item(
     target: &mut impl RenderTarget,
     area: Rect,
-    content_area: Rect,
     item: RenderItem,
     render_y: u16,
     visible_height: u16,
     clipped_top: u16,
 ) {
     match item {
-        RenderItem::Paragraph { paragraph, height } => {
-            let render_area =
-                Rect::new(content_area.x, render_y, content_area.width, visible_height);
-            target.render_paragraph(paragraph.scroll((clipped_top, 0)), render_area);
-            let _ = height;
+        RenderItem::Paragraph { paragraph, .. } => {
+            target.render_paragraph(
+                paragraph.scroll((clipped_top, 0)),
+                Rect::new(area.x, render_y, area.width, visible_height),
+            );
         }
         RenderItem::Prompt {
             paragraph,
             height,
             cursor,
         } => {
-            let render_area =
-                Rect::new(content_area.x, render_y, content_area.width, visible_height);
+            let render_area = Rect::new(area.x, render_y, area.width, visible_height);
             target.render_paragraph(paragraph.scroll((clipped_top, 0)), render_area);
             set_prompt_cursor_if_visible(target, render_area, height, clipped_top, cursor);
         }
@@ -451,7 +487,6 @@ fn set_prompt_cursor_if_visible(
     if render_area.width == 0 {
         return;
     }
-
     if cursor.row >= clipped_top && cursor.row < clipped_top + render_area.height {
         target.set_cursor(Some((
             render_area.x + cursor.column.min(render_area.width.saturating_sub(1)),
@@ -490,39 +525,32 @@ fn render_footer(
                 &visible_draft,
                 prompt_height,
             )));
-        } else if prompt_area.width > 0 {
-            let cursor_x = prompt_area.x
-                + visible_draft
-                    .chars()
-                    .count()
-                    .min(prompt_area.width.saturating_sub(1) as usize) as u16;
-            target.set_cursor(Some((cursor_x, prompt_area.y)));
         }
     }
 
     if area.height > prompt_height {
         let mode_y = area.y + prompt_height;
         let mode_area = Rect::new(area.x, mode_y, area.width, 1);
+        let mode_label = match mode {
+            Mode::Insert => "-- INSERT --",
+            Mode::Normal => "-- NORMAL --",
+            Mode::Command => "-- COMMAND --",
+            Mode::ConfirmDelete => "-- CONFIRM --",
+        };
+        let style = match mode {
+            Mode::Insert => Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+            Mode::Normal => Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            Mode::Command => Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            Mode::ConfirmDelete => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        };
         target.render_paragraph(
-            Paragraph::new(Line::from(vec![Span::styled(
-                match mode {
-                    Mode::Insert => "-- INSERT --",
-                    Mode::Normal => "-- NORMAL --",
-                    Mode::Command => "-- COMMAND --",
-                }
-                .to_string(),
-                match mode {
-                    Mode::Insert => Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                    Mode::Normal => Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                    Mode::Command => Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                },
-            )])),
+            Paragraph::new(Line::from(vec![Span::styled(mode_label, style)])),
             mode_area,
         );
     }
@@ -537,18 +565,36 @@ fn render_command_palette_overlay(
         return;
     }
 
-    let layout = command_palette_layout(
+    let Some(layout) = command_palette_layout(
         area,
         palette.draft,
         palette.preview_text,
         palette.suggestions,
-    );
-    let Some(layout) = layout else {
+        palette.error_text,
+    ) else {
         return;
     };
 
+    if let Some(error_text) = palette.error_text {
+        render_overlay_at(
+            target,
+            "error",
+            error_text,
+            true,
+            overlay_above(layout.box_area, area, error_text),
+        );
+    }
+
+    let border_style = if palette.has_error {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default()
+    };
     target.render_block(
-        Block::default().borders(Borders::ALL).title("cmd"),
+        Block::default()
+            .borders(Borders::ALL)
+            .title("cmd")
+            .border_style(border_style),
         layout.box_area,
     );
     target.render_paragraph(
@@ -560,14 +606,72 @@ fn render_command_palette_overlay(
     );
     target.set_cursor(Some(command_palette_cursor(layout.box_area, palette.draft)));
 
-    if layout.list_area.height == 0 {
+    if layout.list_area.height > 0 {
+        target.render_paragraph(
+            command_suggestions_paragraph(palette.suggestions, palette.highlighted),
+            layout.list_area,
+        );
+    }
+}
+
+fn render_floating_message_overlay(
+    target: &mut impl RenderTarget,
+    area: Rect,
+    title: &str,
+    text: &str,
+    error: bool,
+) {
+    render_overlay_at(target, title, text, error, overlay_centered(area, text));
+}
+
+fn render_overlay_at(
+    target: &mut impl RenderTarget,
+    title: &str,
+    text: &str,
+    error: bool,
+    box_area: Rect,
+) {
+    if box_area.width == 0 || box_area.height == 0 {
         return;
     }
-
-    target.render_paragraph(
-        command_suggestions_paragraph(palette.suggestions, palette.highlighted),
-        layout.list_area,
+    target.render_block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title.to_string())
+            .border_style(if error {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default()
+            }),
+        box_area,
     );
+    target.render_paragraph(
+        Paragraph::new(Line::from(text.to_string())),
+        box_area.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        }),
+    );
+}
+
+fn overlay_centered(area: Rect, text: &str) -> Rect {
+    let width = (text.chars().count() as u16 + 4)
+        .max(24)
+        .min(area.width.saturating_sub(2).max(1));
+    let height = 3;
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(6);
+    Rect::new(x, y, width, height)
+}
+
+fn overlay_above(anchor: Rect, bounds: Rect, text: &str) -> Rect {
+    let width = (text.chars().count() as u16 + 4)
+        .max(24)
+        .min(bounds.width.saturating_sub(2).max(1));
+    let height = 3;
+    let x = anchor.x + anchor.width.saturating_sub(width) / 2;
+    let y = anchor.y.saturating_sub(height).max(bounds.y);
+    Rect::new(x, y, width, height)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -581,12 +685,12 @@ fn command_palette_layout(
     draft: &str,
     preview_text: Option<&str>,
     suggestions: &[crate::command_palette::CommandSuggestion],
+    error_text: Option<&str>,
 ) -> Option<CommandPaletteLayout> {
     let box_height = 3;
     if area.width < 6 || area.height < box_height {
         return None;
     }
-
     let suggestion_width = suggestions
         .iter()
         .map(|suggestion| suggestion.display.chars().count() as u16)
@@ -596,7 +700,13 @@ fn command_palette_layout(
         .map(|text| text.chars().count() as u16)
         .unwrap_or(0);
     let draft_width = draft.chars().count() as u16;
-    let content_width = suggestion_width.max(preview_width).max(draft_width);
+    let error_width = error_text
+        .map(|text| text.chars().count() as u16)
+        .unwrap_or(0);
+    let content_width = suggestion_width
+        .max(preview_width)
+        .max(draft_width)
+        .max(error_width);
     let width = (content_width + 4)
         .max(24)
         .min(area.width.saturating_sub(2).max(1));
@@ -604,12 +714,9 @@ fn command_palette_layout(
     let total_height = box_height + list_height;
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(total_height) / 2;
-
-    let box_area = Rect::new(x, y, width, box_height);
-    let list_area = Rect::new(x, y + box_height, width, list_height);
     Some(CommandPaletteLayout {
-        box_area,
-        list_area,
+        box_area: Rect::new(x, y, width, box_height),
+        list_area: Rect::new(x, y + box_height, width, list_height),
     })
 }
 
@@ -630,7 +737,6 @@ fn command_prompt_paragraph(draft: &str, preview_text: Option<&str>) -> Paragrap
     } else {
         Line::from(draft.to_string())
     };
-
     Paragraph::new(line)
 }
 
@@ -653,7 +759,6 @@ fn command_suggestions_paragraph(
             style,
         )]));
     }
-
     Paragraph::new(lines)
 }
 
@@ -664,14 +769,7 @@ fn command_palette_cursor(area: Rect, draft: &str) -> (u16, u16) {
     (x.min(area.x + area.width.saturating_sub(2)), inner_y)
 }
 
-fn transcript_content_area(area: Rect) -> Rect {
-    let padding = 2;
-    let x = area.x.saturating_add(padding);
-    let width = area.width.saturating_sub(padding * 2);
-    Rect::new(x, area.y, width, area.height)
-}
-
-impl TranscriptEntry {
+impl HistoryEntry {
     fn paragraph(
         &self,
         selected: bool,
@@ -695,39 +793,13 @@ impl TranscriptEntry {
         };
 
         match self {
-            Self::User(content) => Paragraph::new(content.clone())
-                .style(base_style)
-                .wrap(Wrap { trim: false }),
             Self::Assistant {
                 model_id,
+                prompt,
                 content,
                 callouts,
                 status,
             } => {
-                let rendered_content = match status {
-                    Some(AssistantStatus::Loading { started_at }) => {
-                        format!(
-                            "{} loading {}... {}s",
-                            spinner_frame(started_at.elapsed()),
-                            model_id,
-                            started_at.elapsed().as_secs()
-                        )
-                    }
-                    Some(AssistantStatus::Loaded) => format!("{model_id} model loaded"),
-                    Some(AssistantStatus::Generating { started_at }) => format!(
-                        "{} generating message... {}s",
-                        spinner_frame(started_at.elapsed()),
-                        started_at.elapsed().as_secs()
-                    ),
-                    None => content.clone(),
-                };
-
-                let rendered_content = if callouts.is_empty() {
-                    rendered_content
-                } else {
-                    format!("{rendered_content}\n\n{}", callouts.join("\n"))
-                };
-
                 let empty_model_colors = HashMap::new();
                 let model_colors = model_colors.unwrap_or(&empty_model_colors);
                 let model_label_style = model_colors.get(model_id).copied().map_or(
@@ -736,36 +808,122 @@ impl TranscriptEntry {
                         .add_modifier(Modifier::DIM),
                     |color| Style::default().fg(color).add_modifier(Modifier::DIM),
                 );
+                let mut lines = Vec::new();
+                lines.push(Line::from(vec![Span::styled(
+                    prompt.to_string(),
+                    base_style,
+                )]));
+                lines.push(Line::from(Vec::<Span<'static>>::new()));
+                lines.push(Line::from(vec![Span::styled(
+                    model_id.to_string(),
+                    if selected {
+                        model_label_style.reversed()
+                    } else {
+                        model_label_style
+                    },
+                )]));
 
-                let model_label_style = if selected {
-                    model_label_style.reversed()
-                } else {
-                    model_label_style
-                };
+                match status {
+                    Some(AssistantStatus::Queued { started_at }) => {
+                        lines.push(Line::from(Vec::<Span<'static>>::new()));
+                        lines.push(Line::from(vec![Span::styled(
+                            format!(
+                                "{} queued... {}s",
+                                spinner_frame(started_at.elapsed()),
+                                started_at.elapsed().as_secs()
+                            ),
+                            base_style,
+                        )]));
+                    }
+                    Some(AssistantStatus::Loading { started_at }) => {
+                        lines.push(Line::from(Vec::<Span<'static>>::new()));
+                        lines.push(Line::from(vec![Span::styled(
+                            format!(
+                                "{} loading... {}s",
+                                spinner_frame(started_at.elapsed()),
+                                started_at.elapsed().as_secs()
+                            ),
+                            base_style,
+                        )]));
+                    }
+                    Some(AssistantStatus::Generating { started_at }) => {
+                        lines.push(Line::from(Vec::<Span<'static>>::new()));
+                        lines.push(Line::from(vec![Span::styled(
+                            format!(
+                                "{} generating... {}s",
+                                spinner_frame(started_at.elapsed()),
+                                started_at.elapsed().as_secs()
+                            ),
+                            base_style,
+                        )]));
+                    }
+                    None => {
+                        if !content.is_empty() {
+                            lines.push(Line::from(Vec::<Span<'static>>::new()));
+                            lines.extend(content.split('\n').map(|line| {
+                                Line::from(vec![Span::styled(line.to_string(), base_style)])
+                            }));
+                        }
+                    }
+                }
 
-                labeled_paragraph(model_id, &rendered_content, base_style, model_label_style)
+                if !callouts.is_empty() {
+                    lines.push(Line::from(Vec::<Span<'static>>::new()));
+                    lines.extend(
+                        callouts
+                            .iter()
+                            .cloned()
+                            .map(|line| Line::from(vec![Span::styled(line, base_style)])),
+                    );
+                }
+
+                Paragraph::new(lines).wrap(Wrap { trim: false })
             }
-            Self::System { content, status } => {
+            Self::LoadingModel { model_id, status } => {
                 let rendered_content = match status {
-                    Some(SystemStatus::Loading {
-                        model_id,
-                        started_at,
-                    }) => format!(
-                        "{} loading {}... {}s",
+                    Some(ModelLoadStatus::Loading { started_at }) => format!(
+                        "{} loading model... {}s",
                         spinner_frame(started_at.elapsed()),
-                        model_id,
                         started_at.elapsed().as_secs()
                     ),
-                    None => content.clone(),
+                    Some(ModelLoadStatus::Loaded) | None => {
+                        format!("model loaded: {model_id}")
+                    }
                 };
-
                 labeled_paragraph(
-                    "system",
+                    "loading",
                     &rendered_content,
                     base_style.fg(Color::DarkGray),
                     label_style,
                 )
             }
+            Self::Command { raw, result } => labeled_paragraph(
+                "cmd",
+                &format!(":{raw}\n{result}"),
+                base_style.fg(Color::LightBlue),
+                if selected {
+                    Style::default()
+                        .reversed()
+                        .fg(Color::LightBlue)
+                        .add_modifier(Modifier::DIM)
+                } else {
+                    Style::default()
+                        .fg(Color::LightBlue)
+                        .add_modifier(Modifier::DIM)
+                },
+            ),
+            Self::Break => labeled_paragraph(
+                "break",
+                "history disconnected here",
+                base_style.fg(Color::LightRed),
+                label_style.fg(Color::LightRed),
+            ),
+            Self::SystemNotice(content) => labeled_paragraph(
+                "system",
+                content,
+                base_style.fg(Color::DarkGray),
+                label_style,
+            ),
         }
     }
 
@@ -773,52 +931,23 @@ impl TranscriptEntry {
         &self,
         draft: &str,
         content_width: u16,
-        model_colors: Option<&HashMap<String, Color>>,
+        _model_colors: Option<&HashMap<String, Color>>,
     ) -> (Paragraph<'static>, u16, PromptCursor) {
         let body_style = Style::default().reversed().add_modifier(Modifier::BOLD);
-        let label_style = Style::default()
-            .fg(Color::Gray)
-            .reversed()
-            .add_modifier(Modifier::DIM);
-
-        match self {
-            Self::User(_) => {
-                let paragraph = Paragraph::new(draft.to_string())
-                    .style(body_style)
-                    .wrap(Wrap { trim: false });
-                let height = paragraph.line_count(content_width).max(1) as u16;
-                let cursor = wrapped_cursor_position(draft, content_width, 0);
-                (paragraph, height, cursor)
-            }
-            Self::Assistant { model_id, .. } => {
-                let empty_model_colors = HashMap::new();
-                let model_colors = model_colors.unwrap_or(&empty_model_colors);
-                let model_label_style = model_colors.get(model_id).copied().map_or(
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .reversed()
-                        .add_modifier(Modifier::DIM),
-                    |color| {
-                        Style::default()
-                            .fg(color)
-                            .reversed()
-                            .add_modifier(Modifier::DIM)
-                    },
-                );
-
-                let paragraph =
-                    labeled_editing_paragraph(model_id, draft, body_style, model_label_style);
-                let height = paragraph.line_count(content_width).max(1) as u16;
-                let cursor = wrapped_cursor_position(draft, content_width, 1);
-                (paragraph, height, cursor)
-            }
-            Self::System { .. } => {
-                let paragraph = labeled_editing_paragraph("system", draft, body_style, label_style);
-                let height = paragraph.line_count(content_width).max(1) as u16;
-                let cursor = wrapped_cursor_position(draft, content_width, 1);
-                (paragraph, height, cursor)
-            }
+        let gutter_style = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let paragraph = Paragraph::new(Line::from(vec![
+            Span::styled("> ", gutter_style),
+            Span::styled(draft.to_string(), body_style),
+        ]))
+        .wrap(Wrap { trim: false });
+        let height = paragraph.line_count(content_width).max(1) as u16;
+        let mut cursor = wrapped_cursor_position(draft, content_width.saturating_sub(2), 0);
+        if cursor.row == 0 {
+            cursor.column = cursor.column.saturating_add(2);
         }
+        (paragraph, height, cursor)
     }
 }
 
@@ -833,32 +962,7 @@ fn labeled_paragraph(
         label.to_string(),
         label_style,
     )]));
-
     if !content.is_empty() {
-        lines.extend(
-            content
-                .split('\n')
-                .map(|line| Line::from(vec![Span::styled(line.to_string(), body_style)])),
-        );
-    }
-
-    Paragraph::new(lines).wrap(Wrap { trim: false })
-}
-
-fn labeled_editing_paragraph(
-    label: &str,
-    content: &str,
-    body_style: Style,
-    label_style: Style,
-) -> Paragraph<'static> {
-    let mut lines = Vec::with_capacity(2);
-    lines.push(Line::from(vec![Span::styled(
-        label.to_string(),
-        label_style,
-    )]));
-    if content.is_empty() {
-        lines.push(Line::from(vec![Span::styled(String::new(), body_style)]));
-    } else {
         lines.extend(
             content
                 .split('\n')
@@ -872,7 +976,6 @@ fn wrapped_cursor_position(text: &str, width: u16, row_offset: u16) -> PromptCur
     let width = width.max(1) as usize;
     let mut row = row_offset as usize;
     let lines: Vec<&str> = text.split('\n').collect();
-
     for (index, line) in lines.iter().enumerate() {
         let line_len = line.chars().count();
         if index + 1 == lines.len() {
@@ -887,17 +990,13 @@ fn wrapped_cursor_position(text: &str, width: u16, row_offset: u16) -> PromptCur
                 column,
             };
         }
-
         row += line_len.max(1).div_ceil(width);
     }
-
     PromptCursor {
         row: row as u16,
         column: 0,
     }
 }
-
-pub struct DividerWidget;
 
 enum RenderItem {
     Paragraph {
@@ -924,6 +1023,17 @@ impl RenderItem {
     }
 }
 
+fn item_ranges(items: &[RenderItem]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::with_capacity(items.len());
+    let mut cursor = 0usize;
+    for item in items {
+        let start = cursor;
+        cursor += item.height() as usize;
+        ranges.push((start, cursor));
+    }
+    ranges
+}
+
 fn prompt_box_height(area_height: u16) -> u16 {
     if area_height >= 3 { 3 } else { 1 }
 }
@@ -935,15 +1045,18 @@ struct PromptCursor {
 }
 
 fn prompt_paragraph(draft: &str, mode: Mode, area_height: u16) -> Paragraph<'static> {
+    let line = Line::from(vec![
+        Span::styled(">", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::raw(draft.to_string()),
+    ]);
     match prompt_box_height(area_height) {
-        3 => Paragraph::new(draft.to_string())
+        3 => Paragraph::new(line)
             .block(Block::default().borders(Borders::ALL).title(match mode {
                 Mode::Insert => "prompt",
-                Mode::Normal => "hidden",
-                Mode::Command => "hidden",
+                _ => "hidden",
             }))
             .wrap(Wrap { trim: false }),
-        _ => Paragraph::new(draft.to_string()),
+        _ => Paragraph::new(line),
     }
 }
 
@@ -951,11 +1064,10 @@ fn prompt_visible_text(draft: &str, width: u16, bordered: bool) -> String {
     if width == 0 {
         return String::new();
     }
-
     let inner_width = if bordered {
-        width.saturating_sub(2) as usize
+        width.saturating_sub(3) as usize
     } else {
-        width as usize
+        width.saturating_sub(1) as usize
     };
     let chars: Vec<char> = draft.chars().collect();
     let start = chars.len().saturating_sub(inner_width);
@@ -967,19 +1079,20 @@ fn prompt_cursor(area: Rect, draft: &str, height: u16) -> (u16, u16) {
         let inner_x = area.x + 1;
         let inner_y = area.y + 1;
         let max_x = area.x + area.width.saturating_sub(2);
-        let x = inner_x + draft.chars().count() as u16;
+        let x = inner_x + 1 + draft.chars().count() as u16;
         (x.min(max_x), inner_y)
     } else {
-        (area.x + draft.chars().count() as u16, area.y)
+        (area.x + 1 + draft.chars().count() as u16, area.y)
     }
 }
+
+pub struct DividerWidget;
 
 impl Widget for DividerWidget {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;
         }
-
         let divider = "─".repeat(area.width as usize);
         buf.set_string(area.x, area.y, divider, Style::default().dim());
     }
@@ -995,6 +1108,7 @@ trait RenderTarget {
     fn render_paragraph(&mut self, paragraph: Paragraph<'static>, area: Rect);
     fn render_divider(&mut self, area: Rect);
     fn render_block(&mut self, block: Block<'static>, area: Rect);
+    fn render_tabs(&mut self, tabs: Tabs<'static>, area: Rect);
     fn set_cursor(&mut self, _position: Option<(u16, u16)>) {}
 }
 
@@ -1009,6 +1123,10 @@ impl RenderTarget for ratatui::Frame<'_> {
 
     fn render_block(&mut self, block: Block<'static>, area: Rect) {
         self.render_widget(block, area);
+    }
+
+    fn render_tabs(&mut self, tabs: Tabs<'static>, area: Rect) {
+        self.render_widget(tabs, area);
     }
 
     fn set_cursor(&mut self, position: Option<(u16, u16)>) {
@@ -1034,267 +1152,31 @@ impl<'a> RenderTarget for BufferTarget<'a> {
     fn render_block(&mut self, block: Block<'static>, area: Rect) {
         block.render(area, self.buf);
     }
+
+    fn render_tabs(&mut self, tabs: Tabs<'static>, area: Rect) {
+        tabs.render(area, self.buf);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
-    use ratatui::style::Modifier;
 
     #[test]
-    fn divider_fills_the_render_area_width() {
-        for width in [1, 4, 9] {
-            let area = Rect::new(0, 0, width, 1);
-            let mut buf = Buffer::empty(area);
-            let mut target = BufferTarget { buf: &mut buf };
-
-            target.render_divider(area);
-
-            let rendered = buffer_line(&buf, 0, width);
-            assert_eq!(rendered, "─".repeat(width as usize));
-        }
-    }
-
-    #[test]
-    fn selected_chat_is_highlighted() {
-        let area = Rect::new(0, 0, 40, 6);
-        let mut buf = Buffer::empty(area);
-        let entries = vec![
-            TranscriptEntry::User("hello".to_string()),
-            TranscriptEntry::Assistant {
-                model_id: "qwen3.5".to_string(),
-                content: "world".to_string(),
-                callouts: vec![],
-                status: None,
-            },
-        ];
-
-        {
-            let mut target = BufferTarget { buf: &mut buf };
-            render_history_viewport(
-                &mut target,
-                area,
-                &mut HistoryScrollState::default(),
-                &entries,
-                Some(1),
-                Mode::Normal,
-                "",
-                false,
-                ScrollAnchor::Bottom,
-                None,
-            );
-        }
-
-        assert!(buffer_has_bold_cell(&buf, area));
-    }
-
-    #[test]
-    fn transcript_messages_have_two_column_horizontal_padding() {
-        let area = Rect::new(0, 0, 20, 4);
-        let mut buf = Buffer::empty(area);
-        let entries = vec![TranscriptEntry::Assistant {
-            model_id: "qwen3.5".to_string(),
-            content: "hello".to_string(),
-            callouts: vec![],
-            status: None,
+    fn command_palette_overlay_renders_error_box_above_command_box() {
+        let area = Rect::new(0, 0, 60, 18);
+        let suggestions = vec![crate::command_palette::CommandSuggestion {
+            display: String::from("model ls"),
+            dispatch: crate::command_palette::CommandDispatch::ListModels,
         }];
-
-        {
-            let mut target = BufferTarget { buf: &mut buf };
-            render_history_viewport(
-                &mut target,
-                area,
-                &mut HistoryScrollState::default(),
-                &entries,
-                Some(0),
-                Mode::Normal,
-                "",
-                false,
-                ScrollAnchor::Bottom,
-                None,
-            );
-        }
-
-        assert!(buffer_contains(&buf, area, "  qwen3.5"));
-    }
-
-    #[test]
-    fn insert_mode_keeps_history_intact_above_the_footer_prompt() {
-        let area = Rect::new(0, 0, 40, 10);
-        let mut buf = Buffer::empty(area);
-        let entries = vec![
-            TranscriptEntry::User("hello".to_string()),
-            TranscriptEntry::Assistant {
-                model_id: "qwen3.5".to_string(),
-                content: "world".to_string(),
-                callouts: vec![],
-                status: None,
-            },
-            TranscriptEntry::User("tail".to_string()),
-        ];
-
-        {
-            let mut target = BufferTarget { buf: &mut buf };
-            render_history_viewport(
-                &mut target,
-                area,
-                &mut HistoryScrollState::default(),
-                &entries,
-                Some(1),
-                Mode::Insert,
-                "",
-                false,
-                ScrollAnchor::Bottom,
-                None,
-            );
-        }
-
-        assert!(buffer_contains(&buf, area, "hello"));
-        assert!(buffer_contains(&buf, area, "world"));
-        assert!(buffer_contains(&buf, area, "tail"));
-        assert_eq!(buffer_occurrences(&buf, area, "draft"), 0);
-    }
-
-    #[test]
-    fn insert_mode_inline_prompt_replaces_selected_message_in_place() {
-        let area = Rect::new(0, 0, 40, 10);
-        let mut buf = Buffer::empty(area);
-        let entries = vec![
-            TranscriptEntry::User("hello".to_string()),
-            TranscriptEntry::Assistant {
-                model_id: "qwen3.5".to_string(),
-                content: "world".to_string(),
-                callouts: vec![],
-                status: None,
-            },
-            TranscriptEntry::User("tail".to_string()),
-        ];
-
-        {
-            let mut target = BufferTarget { buf: &mut buf };
-            render_history_viewport(
-                &mut target,
-                area,
-                &mut HistoryScrollState::default(),
-                &entries,
-                Some(1),
-                Mode::Insert,
-                "draft",
-                true,
-                ScrollAnchor::Bottom,
-                None,
-            );
-        }
-
-        assert!(buffer_contains(&buf, area, "draft"));
-        assert!(!buffer_contains(&buf, area, "world"));
-        assert!(buffer_contains(&buf, area, "tail"));
-        assert!(buffer_contains(&buf, area, "qwen3.5"));
-    }
-
-    #[test]
-    fn inline_edit_preserves_existing_scroll_offset_when_selection_is_visible() {
-        let area = Rect::new(0, 0, 40, 3);
-        let entries = (0..8)
-            .map(|index| TranscriptEntry::User(format!("message {index}")))
-            .collect::<Vec<_>>();
-        let mut state = HistoryScrollState { offset: 4 };
-        let mut buf = Buffer::empty(area);
-
-        {
-            let mut target = BufferTarget { buf: &mut buf };
-            render_history_viewport(
-                &mut target,
-                area,
-                &mut state,
-                &entries,
-                Some(3),
-                Mode::Insert,
-                "message 3",
-                true,
-                ScrollAnchor::Bottom,
-                None,
-            );
-        }
-
-        assert_eq!(state.offset, 4);
-        assert!(buffer_contains(&buf, area, "message 3"));
-    }
-
-    #[test]
-    fn insert_mode_prompt_is_rendered_in_footer() {
-        let area = Rect::new(0, 0, 40, 4);
-        let mut buf = Buffer::empty(area);
-        let mut target = BufferTarget { buf: &mut buf };
-
-        render_footer(&mut target, area, Mode::Insert, "draft", false);
-
-        assert!(buffer_contains(&buf, area, "draft"));
-        assert!(buffer_contains(&buf, area, "INSERT"));
-    }
-
-    #[test]
-    fn command_palette_layout_centers_the_box_and_places_the_list_below_it() {
-        let area = Rect::new(0, 0, 80, 24);
-        let suggestions = vec![
-            crate::command_palette::CommandSuggestion {
-                display: String::from("model smollm2"),
-                dispatch: crate::command_palette::CommandDispatch::SwitchModel(String::from(
-                    "smollm2",
-                )),
-            },
-            crate::command_palette::CommandSuggestion {
-                display: String::from("q"),
-                dispatch: crate::command_palette::CommandDispatch::Quit,
-            },
-        ];
-
-        let layout = command_palette_layout(area, "model ", Some("model smollm2"), &suggestions)
-            .expect("layout should exist");
-
-        assert_eq!(
-            layout.box_area.x,
-            area.x + area.width.saturating_sub(layout.box_area.width) / 2
-        );
-        assert_eq!(layout.list_area.x, layout.box_area.x);
-        assert_eq!(
-            layout.list_area.y,
-            layout.box_area.y + layout.box_area.height
-        );
-        assert_eq!(layout.list_area.width, layout.box_area.width);
-        assert_eq!(layout.list_area.height, suggestions.len() as u16);
-    }
-
-    #[test]
-    fn command_palette_layout_hides_the_list_when_empty() {
-        let area = Rect::new(0, 0, 40, 12);
-        let layout = command_palette_layout(area, "", None, &[]).expect("layout should exist");
-
-        assert_eq!(layout.list_area.height, 0);
-    }
-
-    #[test]
-    fn command_palette_overlay_renders_suggestions_below_the_box() {
-        let area = Rect::new(0, 0, 60, 12);
-        let suggestions = vec![
-            crate::command_palette::CommandSuggestion {
-                display: String::from("model smollm2"),
-                dispatch: crate::command_palette::CommandDispatch::SwitchModel(String::from(
-                    "smollm2",
-                )),
-            },
-            crate::command_palette::CommandSuggestion {
-                display: String::from("q"),
-                dispatch: crate::command_palette::CommandDispatch::Quit,
-            },
-        ];
         let view = CommandPaletteView {
-            draft: "model ",
-            preview_text: Some("model smollm2"),
+            draft: "model bad",
+            preview_text: None,
             suggestions: &suggestions,
-            highlighted: Some(0),
+            highlighted: None,
+            error_text: Some("unknown model"),
+            has_error: true,
         };
 
         let mut buf = Buffer::empty(area);
@@ -1303,35 +1185,50 @@ mod tests {
             render_command_palette_overlay(&mut target, area, view);
         }
 
+        assert!(buffer_contains(&buf, area, "error"));
+        assert!(buffer_contains(&buf, area, "unknown model"));
         assert!(buffer_contains(&buf, area, "cmd"));
-        assert!(buffer_contains(&buf, area, "model smollm2"));
         assert!(
-            buffer_line_index(&buf, area, "model smollm2") > buffer_line_index(&buf, area, "cmd")
+            buffer_line_index(&buf, area, "unknown model") < buffer_line_index(&buf, area, "cmd")
         );
     }
 
     #[test]
-    fn assistant_callouts_render_inside_the_same_box() {
-        let area = Rect::new(0, 0, 40, 10);
+    fn tabs_render_in_header() {
+        let area = Rect::new(0, 0, 60, 4);
         let mut buf = Buffer::empty(area);
-        let entries = vec![TranscriptEntry::Assistant {
-            model_id: "qwen3.5".to_string(),
-            content: "answer".to_string(),
-            callouts: vec![
-                String::from("parsed tool calls:"),
-                String::from("1. search_docs"),
-                String::from("{\n  \"query\": \"docs\"\n}"),
-            ],
-            status: None,
-        }];
+        {
+            let mut target = BufferTarget { buf: &mut buf };
+            render_tabs(
+                &mut target,
+                area,
+                &[
+                    TabRenderInfo {
+                        label: String::from("1. smollm2"),
+                    },
+                    TabRenderInfo {
+                        label: String::from("2. qwen"),
+                    },
+                ],
+                1,
+            );
+        }
 
+        assert!(buffer_contains(&buf, area, "1. smollm2"));
+        assert!(buffer_contains(&buf, area, "2. qwen"));
+    }
+
+    #[test]
+    fn break_entry_is_rendered_distinctly() {
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
         {
             let mut target = BufferTarget { buf: &mut buf };
             render_history_viewport(
                 &mut target,
                 area,
                 &mut HistoryScrollState::default(),
-                &entries,
+                &[HistoryEntry::Break],
                 Some(0),
                 Mode::Normal,
                 "",
@@ -1341,214 +1238,26 @@ mod tests {
             );
         }
 
-        assert!(buffer_contains(&buf, area, "answer"));
-        assert!(buffer_contains(&buf, area, "parsed tool calls:"));
-        assert_eq!(buffer_occurrences(&buf, area, "parsed tool calls:"), 1);
-    }
-
-    #[test]
-    fn history_viewport_preserves_offset_until_selection_leaves_view() {
-        let area = Rect::new(0, 0, 40, 3);
-        let entries = (0..8)
-            .map(|index| TranscriptEntry::User(format!("message {index}")))
-            .collect::<Vec<_>>();
-
-        let mut state = HistoryScrollState { offset: 4 };
-        let mut buf = Buffer::empty(area);
-        {
-            let mut target = BufferTarget { buf: &mut buf };
-            render_history_viewport(
-                &mut target,
-                area,
-                &mut state,
-                &entries,
-                Some(2),
-                Mode::Normal,
-                "",
-                false,
-                ScrollAnchor::Top,
-                None,
-            );
-        }
-        assert_eq!(state.offset, 4);
-
-        let mut buf = Buffer::empty(area);
-        {
-            let mut target = BufferTarget { buf: &mut buf };
-            render_history_viewport(
-                &mut target,
-                area,
-                &mut state,
-                &entries,
-                Some(5),
-                Mode::Normal,
-                "",
-                false,
-                ScrollAnchor::Bottom,
-                None,
-            );
-        }
-
-        assert_eq!(state.offset, 8);
-        assert!(buffer_contains(&buf, area, "message 5"));
-    }
-
-    #[test]
-    fn history_viewport_bottom_aligns_short_transcripts() {
-        let area = Rect::new(0, 0, 40, 5);
-        let mut buf = Buffer::empty(area);
-        let entries = vec![TranscriptEntry::User("latest".to_string())];
-
-        {
-            let mut target = BufferTarget { buf: &mut buf };
-            render_history_viewport(
-                &mut target,
-                area,
-                &mut HistoryScrollState::default(),
-                &entries,
-                None,
-                Mode::Insert,
-                "",
-                false,
-                ScrollAnchor::Bottom,
-                None,
-            );
-        }
-
-        assert!(!buffer_line(&buf, 0, area.width).contains("latest"));
-        assert!(buffer_line(&buf, area.height - 1, area.width).contains("latest"));
-    }
-
-    #[test]
-    fn status_bar_shows_mode_indicator() {
-        let area = Rect::new(0, 0, 24, 1);
-        let mut buf = Buffer::empty(area);
-        let mut target = BufferTarget { buf: &mut buf };
-
-        render_footer(&mut target, area, Mode::Normal, "draft", false);
-
-        assert!(buffer_contains(&buf, area, "NORMAL"));
-        assert!(!buffer_contains(&buf, area, "draft"));
-    }
-
-    #[test]
-    fn status_bar_shows_command_mode_indicator() {
-        let area = Rect::new(0, 0, 24, 1);
-        let mut buf = Buffer::empty(area);
-        let mut target = BufferTarget { buf: &mut buf };
-
-        render_footer(&mut target, area, Mode::Command, "", false);
-
-        assert!(buffer_contains(&buf, area, "COMMAND"));
-    }
-
-    #[test]
-    fn assistant_models_receive_distinct_colors_in_first_seen_order() {
-        let entries = vec![
-            TranscriptEntry::Assistant {
-                model_id: "alpha".to_string(),
-                content: "a".to_string(),
-                callouts: vec![],
-                status: None,
-            },
-            TranscriptEntry::Assistant {
-                model_id: "beta".to_string(),
-                content: "b".to_string(),
-                callouts: vec![],
-                status: None,
-            },
-            TranscriptEntry::Assistant {
-                model_id: "gamma".to_string(),
-                content: "c".to_string(),
-                callouts: vec![],
-                status: None,
-            },
-        ];
-
-        let colors = build_model_color_map(&entries);
-
-        assert_eq!(colors.get("alpha"), Some(&Color::Blue));
-        assert_eq!(colors.get("beta"), Some(&Color::Red));
-        assert_eq!(colors.get("gamma"), Some(&Color::Green));
-    }
-
-    #[test]
-    fn clipboard_text_copies_selected_entry() {
-        let entry = TranscriptEntry::Assistant {
-            model_id: "qwen3.5".to_string(),
-            content: "hello".to_string(),
-            callouts: vec![],
-            status: None,
-        };
-
-        assert_eq!(clipboard_text(&entry), "assistant qwen3.5:\nhello");
-    }
-
-    #[test]
-    fn system_messages_are_selectable_and_copyable() {
-        let entries = vec![
-            TranscriptEntry::User("user".to_string()),
-            TranscriptEntry::System {
-                content: "system".to_string(),
-                status: None,
-            },
-            TranscriptEntry::Assistant {
-                model_id: "qwen3.5".to_string(),
-                content: "assistant".to_string(),
-                callouts: vec![],
-                status: None,
-            },
-        ];
-
-        assert_eq!(chat_entry_positions(&entries), vec![0, 1, 2]);
-        assert_eq!(selected_transcript_index(&entries, Some(1)), Some(1));
-        assert_eq!(clipboard_text(&entries[1]), "system:\nsystem");
-    }
-
-    fn buffer_line(buf: &Buffer, y: u16, width: u16) -> String {
-        (0..width)
-            .map(|x| buf[(x, y)].symbol().to_string())
-            .collect::<Vec<_>>()
-            .join("")
-            .trim_end()
-            .to_string()
+        assert!(buffer_contains(&buf, area, "history disconnected here"));
     }
 
     fn buffer_contains(buf: &Buffer, area: Rect, needle: &str) -> bool {
-        let mut text = String::new();
-        for y in 0..area.height {
-            text.push_str(&buffer_line(buf, y, area.width));
-            text.push('\n');
-        }
-        text.contains(needle)
+        let haystack = (0..area.height)
+            .map(|row| buffer_line(buf, row, area.width))
+            .collect::<Vec<_>>()
+            .join("\n");
+        haystack.contains(needle)
     }
 
-    fn buffer_line_index(buf: &Buffer, area: Rect, needle: &str) -> u16 {
-        for y in 0..area.height {
-            if buffer_line(buf, y, area.width).contains(needle) {
-                return y;
-            }
-        }
-        panic!("buffer did not contain {needle:?}");
+    fn buffer_line_index(buf: &Buffer, area: Rect, needle: &str) -> usize {
+        (0..area.height)
+            .position(|row| buffer_line(buf, row, area.width).contains(needle))
+            .unwrap_or(usize::MAX)
     }
 
-    fn buffer_has_bold_cell(buf: &Buffer, area: Rect) -> bool {
-        for y in 0..area.height {
-            for x in 0..area.width {
-                if buf[(x, y)].style().add_modifier.contains(Modifier::BOLD) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    fn buffer_occurrences(buf: &Buffer, area: Rect, needle: &str) -> usize {
-        let mut text = String::new();
-        for y in 0..area.height {
-            text.push_str(&buffer_line(buf, y, area.width));
-            text.push('\n');
-        }
-        text.match_indices(needle).count()
+    fn buffer_line(buf: &Buffer, row: u16, width: u16) -> String {
+        (0..width)
+            .map(|column| buf[(column, row)].symbol())
+            .collect::<String>()
     }
 }

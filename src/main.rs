@@ -3,7 +3,7 @@ mod command_palette;
 mod runtime;
 mod terminal;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self as std_io, ErrorKind};
@@ -13,14 +13,14 @@ use std::time::{Duration, Instant};
 use agent::{ToolParameter, ToolParameterKind, ToolSpec};
 use arboard::Clipboard;
 use command_palette::{
-    CommandCommit, CommandDispatch, CommandPaletteState, CommandPaletteView, CommandParseError,
+    CommandCommit, CommandDispatch, CommandPaletteState, CommandParseError, TabTarget,
 };
-use crossterm::event::{self, Event, KeyCode, MouseEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind};
 use mistralrs::{RequestBuilder, RequestLike, TextMessageRole, TextMessages};
 use runtime::{RuntimeBuilder, RuntimeConnection, RuntimeResponseEvent, RuntimeStatus};
 use terminal::{
-    AssistantStatus, Mode, RenderState, ScrollAnchor, SystemStatus, TerminalUi, TranscriptEntry,
-    chat_entry_positions, clipboard_text, selected_transcript_index,
+    AssistantStatus, HistoryEntry, Mode, ModelLoadStatus, RenderState, ScrollAnchor,
+    TabRenderInfo, TerminalUi, chat_entry_positions, clipboard_text, selected_transcript_index,
 };
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -32,8 +32,139 @@ const MAX_GENERATION_TOKENS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposeTarget {
-    InsertAfterSelection,
+    EditEntry(u64),
     AppendBottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlineComposePosition {
+    Before,
+    After,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlineCommandPosition {
+    Before,
+    After,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HistoryMeta {
+    None,
+    Command(CommandKind),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelectionEditAction {
+    Prompt(String),
+    Command(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommandKind {
+    Model(String),
+    Tools(bool),
+    ModelList,
+}
+
+impl CommandKind {
+    fn family(&self) -> Option<CommandFamily> {
+        match self {
+            Self::Model(_) => Some(CommandFamily::Model),
+            Self::Tools(_) => Some(CommandFamily::Tools),
+            Self::ModelList => None,
+        }
+    }
+
+    fn matches_semantics(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandFamily {
+    Model,
+    Tools,
+}
+
+#[derive(Debug, Clone)]
+struct HistoryItem {
+    id: u64,
+    entry: HistoryEntry,
+    meta: HistoryMeta,
+}
+
+#[derive(Debug, Clone)]
+struct ThreadConfig {
+    model_id: String,
+    tools_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ThreadJob {
+    assistant_entry_id: u64,
+}
+
+struct ThreadState {
+    tab_id: usize,
+    base_config: ThreadConfig,
+    current_config: ThreadConfig,
+    name_override: Option<String>,
+    history: Vec<HistoryItem>,
+    selected_chat_entry: Option<usize>,
+    compose_target: ComposeTarget,
+    draft: String,
+    scroll_anchor: ScrollAnchor,
+    queue: VecDeque<ThreadJob>,
+    running_job: bool,
+    loaded_models: HashSet<String>,
+    connections: HashMap<String, RuntimeConnection>,
+}
+
+struct AppState {
+    threads: Vec<ThreadState>,
+    active_thread_idx: usize,
+    mode: Mode,
+    command_palette: CommandPaletteState,
+    next_history_id: u64,
+    next_tab_id: usize,
+    command_edit_target: Option<u64>,
+    inline_command_placeholder: Option<(u64, usize)>,
+    delete_target_id: Option<u64>,
+}
+
+enum AppAction {
+    Continue,
+    Quit,
+}
+
+enum AppEvent {
+    Input(Event),
+    Tick,
+    Job(JobEvent),
+}
+
+enum JobEvent {
+    Status {
+        tab_id: usize,
+        assistant_entry_id: u64,
+        status: RuntimeStatus,
+    },
+    Chunk {
+        tab_id: usize,
+        assistant_entry_id: u64,
+        content: String,
+    },
+    Complete {
+        tab_id: usize,
+        assistant_entry_id: u64,
+        callouts: Vec<String>,
+    },
+    Error {
+        tab_id: usize,
+        assistant_entry_id: u64,
+        error: String,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -58,9 +189,8 @@ async fn main() {
 
     let runtime = RuntimeBuilder::new().build();
     let tools = default_tools();
-    let mut tools_enabled = startup.tools_enabled;
-    let mut active_model = startup.model;
-    let mut active_connection = match runtime.open_connection(&active_model).await {
+
+    let initial_connection = match runtime.open_connection(&startup.model).await {
         Ok(connection) => connection,
         Err(err) => {
             eprintln!("failed to open initial model connection: {err}");
@@ -68,15 +198,45 @@ async fn main() {
         }
     };
 
-    let mut transcript: Vec<TranscriptEntry> = Vec::new();
-    push_system_message(&mut transcript, format!("active model: {active_model}"));
-    let mut command_palette = CommandPaletteState::new(
-        runtime
-            .list_configs()
-            .iter()
-            .map(|config| config.id.clone())
-            .collect(),
-    );
+    let initial_thread = ThreadState {
+        tab_id: 1,
+        base_config: ThreadConfig {
+            model_id: startup.model.clone(),
+            tools_enabled: startup.tools_enabled,
+        },
+        current_config: ThreadConfig {
+            model_id: startup.model.clone(),
+            tools_enabled: startup.tools_enabled,
+        },
+        name_override: None,
+        history: Vec::new(),
+        selected_chat_entry: None,
+        compose_target: ComposeTarget::AppendBottom,
+        draft: String::new(),
+        scroll_anchor: ScrollAnchor::Bottom,
+        queue: VecDeque::new(),
+        running_job: false,
+        loaded_models: HashSet::new(),
+        connections: HashMap::from([(startup.model.clone(), initial_connection)]),
+    };
+
+    let mut app = AppState {
+        threads: vec![initial_thread],
+        active_thread_idx: 0,
+        mode: Mode::Insert,
+        command_palette: CommandPaletteState::new(
+            runtime
+                .list_configs()
+                .iter()
+                .map(|config| config.id.clone())
+                .collect(),
+        ),
+        next_history_id: 1,
+        next_tab_id: 2,
+        command_edit_target: None,
+        inline_command_placeholder: None,
+        delete_target_id: None,
+    };
 
     let mut ui = match TerminalUi::new() {
         Ok(ui) => ui,
@@ -87,23 +247,10 @@ async fn main() {
     };
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    let _event_thread = start_event_reader(event_tx);
-    let mut mode = Mode::Insert;
-    let mut selected_chat_entry: Option<usize> = None;
-    let mut chat_draft = String::new();
-    let mut compose_target = ComposeTarget::AppendBottom;
-    let mut scroll_anchor = ScrollAnchor::Bottom;
+    let _event_thread = start_event_reader(event_tx.clone());
+    let _tick_task = start_tick_loop(event_tx.clone());
 
-    if let Err(err) = redraw(
-        &mut ui,
-        &transcript,
-        selected_chat_entry,
-        mode,
-        &chat_draft,
-        compose_target,
-        scroll_anchor,
-        matches!(mode, Mode::Command).then(|| command_palette.view()),
-    ) {
+    if let Err(err) = redraw(&mut ui, &app) {
         eprintln!("failed to render UI: {err}");
         return;
     }
@@ -122,57 +269,25 @@ async fn main() {
                     break;
                 };
 
-        let outcome = match event {
-                    Event::Key(key) => {
-                        handle_key_event(
-                            key,
-                            &mut mode,
-                            &mut selected_chat_entry,
-                            &mut chat_draft,
-                            &mut compose_target,
-                            &mut scroll_anchor,
-                            &mut command_palette,
-                            &mut transcript,
-                            &runtime,
-                            &mut active_connection,
-                            &mut active_model,
-                            &mut tools_enabled,
-                            &tools,
-                            &mut ui,
-                        )
-                        .await
-                    }
-                    Event::Mouse(mouse) => {
-                        handle_mouse_event(
-                            mouse.kind,
-                            &mut mode,
-                            &mut selected_chat_entry,
-                            &mut chat_draft,
-                            &mut compose_target,
-                            &mut scroll_anchor,
-                            &transcript,
-                        );
+                let outcome = match event {
+                    AppEvent::Input(event) => handle_input_event(
+                        event,
+                        &mut app,
+                        &runtime,
+                        &tools,
+                        event_tx.clone(),
+                    ).await,
+                    AppEvent::Tick => Ok(AppAction::Continue),
+                    AppEvent::Job(event) => {
+                        handle_job_event(event, &mut app, &runtime, &tools, event_tx.clone()).await;
                         Ok(AppAction::Continue)
                     }
-                    Event::Resize(_, _) => Ok(AppAction::Continue),
-                    _ => Ok(AppAction::Continue),
                 };
 
                 match outcome {
                     Ok(AppAction::Continue) => {
-                        if matches!(mode, Mode::Normal) {
-                            normalize_selection(&transcript, &mut selected_chat_entry);
-                        }
-                        if let Err(err) = redraw(
-                            &mut ui,
-                            &transcript,
-                            selected_chat_entry,
-                            mode,
-                            &chat_draft,
-                            compose_target,
-                            scroll_anchor,
-                            matches!(mode, Mode::Command).then(|| command_palette.view()),
-                        ) {
+                        normalize_selection(active_thread_mut(&mut app));
+                        if let Err(err) = redraw(&mut ui, &app) {
                             eprintln!("failed to redraw UI: {err}");
                             runtime.request_shutdown();
                             break;
@@ -195,129 +310,72 @@ async fn main() {
         }
     }
 
-    if let Err(err) = active_connection.end_connection().await {
-        eprintln!("failed to close model connection: {err}");
-    }
+    shutdown_connections(&mut app).await;
 }
 
-async fn handle_key_event(
-    key: crossterm::event::KeyEvent,
-    mode: &mut Mode,
-    selected_chat_entry: &mut Option<usize>,
-    chat_draft: &mut String,
-    compose_target: &mut ComposeTarget,
-    scroll_anchor: &mut ScrollAnchor,
-    command_palette: &mut CommandPaletteState,
-    transcript: &mut Vec<TranscriptEntry>,
+async fn handle_input_event(
+    event: Event,
+    app: &mut AppState,
     runtime: &runtime::Runtime,
-    active_connection: &mut RuntimeConnection,
-    active_model: &mut String,
-    tools_enabled: &mut bool,
     tools: &[ToolSpec],
-    ui: &mut TerminalUi,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> std_io::Result<AppAction> {
-    command_palette.set_model_ids(
+    app.command_palette.set_model_ids(
         runtime
             .list_configs()
             .iter()
             .map(|config| config.id.clone()),
     );
+    app.command_palette.set_tab_labels(tab_labels(&app.threads));
 
-    match *mode {
-        Mode::Insert => {
-            handle_chat_key_event(
-                key,
-                mode,
-                selected_chat_entry,
-                chat_draft,
-                compose_target,
-                scroll_anchor,
-                transcript,
-                runtime,
-                active_connection,
-                active_model,
-                tools_enabled,
-                tools,
-                ui,
-            )
-            .await
+    match event {
+        Event::Key(key) => match app.mode {
+            Mode::Insert => handle_insert_key_event(key, app, runtime, tools, app_tx).await,
+            Mode::Normal => handle_normal_key_event(key, app),
+            Mode::Command => handle_command_key_event(key, app, runtime, tools, app_tx).await,
+            Mode::ConfirmDelete => {
+                handle_confirm_delete_key_event(key, app, runtime, tools, app_tx).await
+            }
+        },
+        Event::Mouse(mouse) => {
+            handle_mouse_event(mouse.kind, app);
+            Ok(AppAction::Continue)
         }
-        Mode::Normal => handle_history_key_event(
-            key,
-            mode,
-            selected_chat_entry,
-            chat_draft,
-            compose_target,
-            scroll_anchor,
-            command_palette,
-            transcript,
-        ),
-        Mode::Command => {
-            handle_command_key_event(
-                key,
-                mode,
-                command_palette,
-                selected_chat_entry,
-                compose_target,
-                chat_draft,
-                transcript,
-                runtime,
-                active_connection,
-                active_model,
-                tools_enabled,
-            )
-            .await
-        }
+        Event::Resize(_, _) => Ok(AppAction::Continue),
+        _ => Ok(AppAction::Continue),
     }
 }
 
-async fn handle_chat_key_event(
+async fn handle_insert_key_event(
     key: crossterm::event::KeyEvent,
-    mode: &mut Mode,
-    selected_chat_entry: &mut Option<usize>,
-    chat_draft: &mut String,
-    compose_target: &mut ComposeTarget,
-    scroll_anchor: &mut ScrollAnchor,
-    transcript: &mut Vec<TranscriptEntry>,
+    app: &mut AppState,
     runtime: &runtime::Runtime,
-    active_connection: &mut RuntimeConnection,
-    active_model: &mut String,
-    tools_enabled: &mut bool,
     tools: &[ToolSpec],
-    ui: &mut TerminalUi,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> std_io::Result<AppAction> {
+    let thread = active_thread_mut(app);
     match key.code {
         KeyCode::Esc => {
-            exit_insert_mode(mode, selected_chat_entry, *compose_target, transcript);
+            exit_insert_mode(thread);
+            app.mode = Mode::Normal;
         }
         KeyCode::Enter => {
-            let input = chat_draft.trim().to_string();
-            chat_draft.clear();
+            let input = thread.draft.trim().to_string();
+            thread.draft.clear();
             if input.is_empty() {
                 return Ok(AppAction::Continue);
             }
-
-            submit_chat_turn(
-                input,
-                mode,
-                selected_chat_entry,
-                compose_target,
-                scroll_anchor,
-                transcript,
-                runtime,
-                active_connection,
-                active_model,
-                *tools_enabled,
-                tools,
-                ui,
-            )
-            .await?;
+            submit_chat_turn(app, input, runtime, tools, app_tx).await?;
         }
         KeyCode::Backspace => {
-            chat_draft.pop();
+            thread.draft.pop();
         }
-        KeyCode::Char(ch) if key.modifiers.is_empty() => {
-            chat_draft.push(ch);
+        KeyCode::Char(ch)
+            if !key.modifiers.intersects(
+                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+            ) =>
+        {
+            thread.draft.push(ch);
         }
         _ => {}
     }
@@ -325,60 +383,88 @@ async fn handle_chat_key_event(
     Ok(AppAction::Continue)
 }
 
-fn handle_history_key_event(
+fn handle_normal_key_event(
     key: crossterm::event::KeyEvent,
-    mode: &mut Mode,
-    selected_chat_entry: &mut Option<usize>,
-    chat_draft: &mut String,
-    compose_target: &mut ComposeTarget,
-    scroll_anchor: &mut ScrollAnchor,
-    command_palette: &mut CommandPaletteState,
-    transcript: &mut Vec<TranscriptEntry>,
+    app: &mut AppState,
 ) -> std_io::Result<AppAction> {
     match key.code {
-        KeyCode::Esc => {}
-        KeyCode::Enter => {
-            open_footer_compose(mode, selected_chat_entry, compose_target, chat_draft);
-        }
+        KeyCode::Enter => open_footer_compose(app),
         KeyCode::Char(':') => {
-            *mode = Mode::Command;
-            command_palette.open();
+            app.mode = Mode::Command;
+            app.command_edit_target = None;
+            app.command_palette.open();
         }
         KeyCode::Char('i') => {
-            open_inline_compose_for_selection(
-                transcript,
-                selected_chat_entry,
-                compose_target,
-                mode,
-                chat_draft,
-            );
-        }
-        KeyCode::Char('o') => {
-            open_compose_after_selection(
-                transcript,
-                selected_chat_entry,
-                compose_target,
-                mode,
-                chat_draft,
-            );
-        }
-        KeyCode::Char('j') | KeyCode::Down => {
-            *scroll_anchor = ScrollAnchor::Bottom;
-            *selected_chat_entry = move_selection(transcript, *selected_chat_entry, 1);
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            *scroll_anchor = ScrollAnchor::Top;
-            *selected_chat_entry = move_selection(transcript, *selected_chat_entry, -1);
-        }
-        KeyCode::Char('y') => {
-            if let Some(index) = selected_transcript_index(transcript, *selected_chat_entry) {
-                if let Some(entry) = transcript.get(index) {
-                    if let Err(err) = yank_entry(entry) {
-                        push_system_message(transcript, format!("clipboard error: {err}"));
+            let selected = {
+                let thread = active_thread(app);
+                selected_transcript_index(&history_entries(thread), thread.selected_chat_entry)
+            };
+            if let Some(index) = selected {
+                let action = {
+                    let thread = active_thread(app);
+                    selection_edit_action(&thread.history[index].entry)
+                        .map(|action| (thread.history[index].id, action))
+                };
+                if let Some((entry_id, action)) = action {
+                    match action {
+                        SelectionEditAction::Prompt(draft) => {
+                            let thread = active_thread_mut(app);
+                            thread.selected_chat_entry = Some(index);
+                            thread.compose_target = ComposeTarget::EditEntry(entry_id);
+                            thread.draft = draft;
+                            app.mode = Mode::Insert;
+                        }
+                        SelectionEditAction::Command(draft) => {
+                            app.mode = Mode::Command;
+                            app.command_edit_target = Some(entry_id);
+                            app.command_palette.open_with_draft(draft);
+                        }
                     }
                 }
             }
         }
+        KeyCode::Char('o') => {
+            open_inline_compose_relative(app, InlineComposePosition::After);
+        }
+        KeyCode::Char('O') => {
+            open_inline_compose_relative(app, InlineComposePosition::Before);
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            let thread = active_thread_mut(app);
+            thread.scroll_anchor = ScrollAnchor::Bottom;
+            thread.selected_chat_entry = move_selection(thread, 1);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            let thread = active_thread_mut(app);
+            thread.scroll_anchor = ScrollAnchor::Top;
+            thread.selected_chat_entry = move_selection(thread, -1);
+        }
+        KeyCode::Char('y') => {
+            let selected = {
+                let thread = active_thread(app);
+                selected_transcript_index(&history_entries(thread), thread.selected_chat_entry)
+            };
+            if let Some(index) = selected {
+                let result = {
+                    let thread = active_thread(app);
+                    let entries = history_entries(thread);
+                    yank_entry(&entries, index)
+                };
+                if let Err(err) = result {
+                    push_notice_current(app, format!("clipboard error: {err}"));
+                }
+            }
+        }
+        KeyCode::Char('d') => {
+            let thread = active_thread(app);
+            if let Some(index) =
+                selected_transcript_index(&history_entries(thread), thread.selected_chat_entry)
+            {
+                app.delete_target_id = Some(thread.history[index].id);
+                app.mode = Mode::ConfirmDelete;
+            }
+        }
+        KeyCode::Tab => cycle_active_tab(app),
         _ => {}
     }
 
@@ -387,52 +473,60 @@ fn handle_history_key_event(
 
 async fn handle_command_key_event(
     key: crossterm::event::KeyEvent,
-    mode: &mut Mode,
-    command_palette: &mut CommandPaletteState,
-    selected_chat_entry: &mut Option<usize>,
-    compose_target: &mut ComposeTarget,
-    chat_draft: &mut String,
-    transcript: &mut Vec<TranscriptEntry>,
+    app: &mut AppState,
     runtime: &runtime::Runtime,
-    active_connection: &mut RuntimeConnection,
-    active_model: &mut String,
-    tools_enabled: &mut bool,
+    tools: &[ToolSpec],
+    app_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> std_io::Result<AppAction> {
     match key.code {
         KeyCode::Esc => {
-            command_palette.close();
-            *mode = Mode::Normal;
+            cancel_inline_command_insert(app);
+            app.command_palette.close();
+            app.command_edit_target = None;
+            app.mode = Mode::Normal;
         }
         KeyCode::Tab => {
-            let _returned_to_editor = command_palette.cycle_selection();
+            let _ = app.command_palette.cycle_selection();
         }
-        KeyCode::Enter => match command_palette.commit() {
+        KeyCode::Enter => match app.command_palette.commit() {
             Ok(CommandCommit::StayOpen) => {}
             Ok(CommandCommit::Execute(dispatch)) => {
-                return execute_command_dispatch(
-                    dispatch,
-                    mode,
-                    command_palette,
-                    selected_chat_entry,
-                    compose_target,
-                    chat_draft,
-                    transcript,
-                    runtime,
-                    active_connection,
-                    active_model,
-                    tools_enabled,
-                )
-                .await;
+                return execute_command_dispatch(dispatch, app, runtime, tools, app_tx).await;
             }
             Err(err) => {
-                push_command_error(transcript, err);
+                push_command_error(&mut app.command_palette, err);
             }
         },
-        KeyCode::Backspace => {
-            command_palette.backspace();
+        KeyCode::Backspace => app.command_palette.backspace(),
+        KeyCode::Char(ch)
+            if !key.modifiers.intersects(
+                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+            ) =>
+        {
+            app.command_palette.input_char(ch)
         }
-        KeyCode::Char(ch) if key.modifiers.is_empty() => {
-            command_palette.input_char(ch);
+        _ => {}
+    }
+    Ok(AppAction::Continue)
+}
+
+async fn handle_confirm_delete_key_event(
+    key: crossterm::event::KeyEvent,
+    app: &mut AppState,
+    runtime: &runtime::Runtime,
+    tools: &[ToolSpec],
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) -> std_io::Result<AppAction> {
+    match key.code {
+        KeyCode::Char('n') | KeyCode::Esc => {
+            app.delete_target_id = None;
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Char('y') => {
+            if let Some(target_id) = app.delete_target_id.take() {
+                delete_history_entry(app, target_id, runtime, tools, app_tx).await?;
+            }
+            app.mode = Mode::Normal;
         }
         _ => {}
     }
@@ -442,658 +536,1397 @@ async fn handle_command_key_event(
 
 async fn execute_command_dispatch(
     dispatch: CommandDispatch,
-    mode: &mut Mode,
-    command_palette: &mut CommandPaletteState,
-    selected_chat_entry: &mut Option<usize>,
-    compose_target: &mut ComposeTarget,
-    chat_draft: &mut String,
-    transcript: &mut Vec<TranscriptEntry>,
+    app: &mut AppState,
     runtime: &runtime::Runtime,
-    active_connection: &mut RuntimeConnection,
-    active_model: &mut String,
-    tools_enabled: &mut bool,
+    tools: &[ToolSpec],
+    app_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> std_io::Result<AppAction> {
     match dispatch {
         CommandDispatch::Quit => Ok(AppAction::Quit),
+        CommandDispatch::OpenModelPrefix
+        | CommandDispatch::OpenToolsPrefix
+        | CommandDispatch::OpenTabPrefix => Ok(AppAction::Continue),
+        CommandDispatch::OpenCommandAfter => {
+            open_inline_command_relative(app, InlineCommandPosition::After);
+            Ok(AppAction::Continue)
+        }
+        CommandDispatch::OpenCommandBefore => {
+            open_inline_command_relative(app, InlineCommandPosition::Before);
+            Ok(AppAction::Continue)
+        }
+        CommandDispatch::ListModels => {
+            let models = runtime
+                .list_configs()
+                .iter()
+                .map(|config| config.id.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            apply_history_command_edit_or_insert(
+                app,
+                runtime,
+                tools,
+                app_tx,
+                "model ls".to_string(),
+                HistoryEntry::Command {
+                    raw: "model ls".to_string(),
+                    result: models,
+                },
+                HistoryMeta::Command(CommandKind::ModelList),
+                false,
+            )
+            .await?;
+            Ok(AppAction::Continue)
+        }
         CommandDispatch::SwitchModel(model_id) => {
-            tracing::info!(
-                from = %active_model,
-                to = %model_id,
-                "switching runtime model"
-            );
-
-            match runtime.open_connection(&model_id).await {
-                Ok(connection) => {
-                    if let Err(err) = active_connection.end_connection().await {
-                        push_system_message(
-                            transcript,
-                            format!("failed to close previous model connection: {err}"),
-                        );
-                    }
-
-                    *active_connection = connection;
-                    active_model.clear();
-                    active_model.push_str(&model_id);
-                    push_system_message(transcript, format!("active model: {active_model}"));
-                }
-                Err(err) => {
-                    push_system_message(transcript, err.to_string());
-                }
+            if runtime.config(&model_id).is_none() {
+                app.command_palette.set_error(format!(
+                    "{model_id} is not a recognised model, use :model ls to show available models"
+                ));
+                return Ok(AppAction::Continue);
             }
-
-            command_palette.close();
-            open_footer_compose(mode, selected_chat_entry, compose_target, chat_draft);
-
+            ensure_thread_connection(active_thread_mut(app), runtime, &model_id).await?;
+            apply_history_command_edit_or_insert(
+                app,
+                runtime,
+                tools,
+                app_tx,
+                format!("model {model_id}"),
+                HistoryEntry::Command {
+                    raw: format!("model {model_id}"),
+                    result: format!("active model: {model_id}"),
+                },
+                HistoryMeta::Command(CommandKind::Model(model_id)),
+                true,
+            )
+            .await?;
             Ok(AppAction::Continue)
         }
         CommandDispatch::SetToolsEnabled(enabled) => {
-            let changed = *tools_enabled != enabled;
-            *tools_enabled = enabled;
-            let status = if enabled { "enabled" } else { "disabled" };
-            push_system_message(transcript, format!("tools prompt is now {status}"));
-            if changed {
-                tracing::info!(enabled, "tool prompt toggle requested");
+            let raw = if enabled {
+                "tools enable"
+            } else {
+                "tools disable"
+            };
+            let result = if enabled {
+                "tools prompt is now enabled"
+            } else {
+                "tools prompt is now disabled"
+            };
+            apply_history_command_edit_or_insert(
+                app,
+                runtime,
+                tools,
+                app_tx,
+                raw.to_string(),
+                HistoryEntry::Command {
+                    raw: raw.to_string(),
+                    result: result.to_string(),
+                },
+                HistoryMeta::Command(CommandKind::Tools(enabled)),
+                true,
+            )
+            .await?;
+            Ok(AppAction::Continue)
+        }
+        CommandDispatch::Break => {
+            let editing = app.command_edit_target.take();
+            if let Some(entry_id) = editing {
+                replace_history_entry(
+                    active_thread_mut(app),
+                    entry_id,
+                    HistoryEntry::Break,
+                    HistoryMeta::None,
+                );
+                recompute_thread_config(active_thread_mut(app));
+                let thread = active_thread_mut(app);
+                if let Some(index) = find_history_index(thread, entry_id) {
+                    enqueue_replay_from_index(app, index, None, runtime, tools, app_tx).await?;
+                }
+            } else {
+                let history_id = next_history_id(app);
+                push_history_entry(
+                    active_thread_mut(app),
+                    history_id,
+                    HistoryEntry::Break,
+                    HistoryMeta::None,
+                );
             }
-
-            command_palette.close();
-            open_footer_compose(mode, selected_chat_entry, compose_target, chat_draft);
+            close_command_mode(app);
             Ok(AppAction::Continue)
         }
-        CommandDispatch::OpenModelPrefix | CommandDispatch::OpenToolsPrefix => {
+        CommandDispatch::ActivateTab(target) => {
+            if let Some(index) = resolve_tab_target(&app.threads, &target) {
+                app.active_thread_idx = index;
+                close_command_mode(app);
+            } else {
+                app.command_palette.set_error(format!(
+                    "unknown tab target: {}",
+                    render_tab_target(&target)
+                ));
+            }
+            Ok(AppAction::Continue)
+        }
+        CommandDispatch::NewTab(model_id) => {
+            if runtime.config(&model_id).is_none() {
+                app.command_palette.set_error(format!(
+                    "{model_id} is not a recognised model, use :model ls to show available models"
+                ));
+                return Ok(AppAction::Continue);
+            }
+            let connection = runtime
+                .open_connection(&model_id)
+                .await
+                .map_err(|err| std_io::Error::other(err.to_string()))?;
+            let tools_enabled = active_thread(app).current_config.tools_enabled;
+            let tab_id = app.next_tab_id;
+            app.next_tab_id += 1;
+            app.threads.push(ThreadState {
+                tab_id,
+                base_config: ThreadConfig {
+                    model_id: model_id.clone(),
+                    tools_enabled,
+                },
+                current_config: ThreadConfig {
+                    model_id: model_id.clone(),
+                    tools_enabled,
+                },
+                name_override: None,
+                history: Vec::new(),
+                selected_chat_entry: None,
+                compose_target: ComposeTarget::AppendBottom,
+                draft: String::new(),
+                scroll_anchor: ScrollAnchor::Bottom,
+                queue: VecDeque::new(),
+                running_job: false,
+                loaded_models: HashSet::new(),
+                connections: HashMap::from([(model_id, connection)]),
+            });
+            app.active_thread_idx = app.threads.len() - 1;
+            close_command_mode(app);
+            Ok(AppAction::Continue)
+        }
+        CommandDispatch::RenameTab { target, new_name } => {
+            let trimmed = new_name.trim();
+            if trimmed.is_empty() {
+                app.command_palette.set_error("tab name cannot be empty");
+                return Ok(AppAction::Continue);
+            }
+            if tab_labels(&app.threads).iter().any(|name| name == trimmed) {
+                app.command_palette
+                    .set_error(format!("tab name already exists: {trimmed}"));
+                return Ok(AppAction::Continue);
+            }
+            if let Some(index) = resolve_tab_target(&app.threads, &target) {
+                app.threads[index].name_override = Some(trimmed.to_string());
+                close_command_mode(app);
+            } else {
+                app.command_palette.set_error(format!(
+                    "unknown tab target: {}",
+                    render_tab_target(&target)
+                ));
+            }
+            Ok(AppAction::Continue)
+        }
+        CommandDispatch::KillTab(target) => {
+            if app.threads.len() == 1 {
+                app.command_palette
+                    .set_error("cannot kill the final remaining tab");
+                return Ok(AppAction::Continue);
+            }
+            if let Some(index) = resolve_tab_target(&app.threads, &target) {
+                let mut thread = app.threads.remove(index);
+                close_thread_connections(&mut thread).await;
+                app.active_thread_idx = app
+                    .active_thread_idx
+                    .min(app.threads.len().saturating_sub(1));
+                close_command_mode(app);
+            } else {
+                app.command_palette.set_error(format!(
+                    "unknown tab target: {}",
+                    render_tab_target(&target)
+                ));
+            }
             Ok(AppAction::Continue)
         }
     }
 }
 
-fn push_command_error(transcript: &mut Vec<TranscriptEntry>, err: CommandParseError) {
-    match err {
-        CommandParseError::Empty => {}
-        CommandParseError::Incomplete(message) | CommandParseError::Invalid(message) => {
-            push_system_message(transcript, message);
+async fn apply_history_command_edit_or_insert(
+    app: &mut AppState,
+    runtime: &runtime::Runtime,
+    tools: &[ToolSpec],
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+    raw: String,
+    entry: HistoryEntry,
+    meta: HistoryMeta,
+    replay_affecting: bool,
+) -> std_io::Result<()> {
+    let editing = app.command_edit_target.take();
+    if let Some(entry_id) = editing {
+        let thread = active_thread_mut(app);
+        replace_history_entry(thread, entry_id, entry, meta.clone());
+        recompute_thread_config(thread);
+        let index = find_history_index(thread, entry_id);
+        if replay_affecting {
+            if let Some(index) = index {
+                replay_edited_command(app, index, meta, runtime, tools, app_tx).await?;
+            }
         }
+    } else {
+        let history_id = next_history_id(app);
+        let thread = active_thread_mut(app);
+        push_history_entry(thread, history_id, entry, meta);
+        recompute_thread_config(thread);
     }
+    if raw.is_empty() {
+        let _ = raw;
+    }
+    close_command_mode(app);
+    Ok(())
 }
 
-fn handle_mouse_event(
-    kind: MouseEventKind,
-    mode: &mut Mode,
-    selected_chat_entry: &mut Option<usize>,
-    draft: &mut String,
-    compose_target: &mut ComposeTarget,
-    scroll_anchor: &mut ScrollAnchor,
-    transcript: &[TranscriptEntry],
+async fn replay_edited_command(
+    app: &mut AppState,
+    command_index: usize,
+    meta: HistoryMeta,
+    runtime: &runtime::Runtime,
+    tools: &[ToolSpec],
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) -> std_io::Result<()> {
+    let HistoryMeta::Command(new_kind) = meta else {
+        return Ok(());
+    };
+
+    let mut replay_end = None;
+    let mut compacted = false;
+
+    {
+        let thread = active_thread_mut(app);
+        if let Some(family) = new_kind.family() {
+            let next_same = thread
+                .history
+                .iter()
+                .enumerate()
+                .skip(command_index + 1)
+                .find_map(|(index, item)| match &item.meta {
+                    HistoryMeta::Command(other) if other.family() == Some(family) => {
+                        Some((index, other.clone()))
+                    }
+                    _ => None,
+                });
+
+            if let Some((index, other_kind)) = next_same {
+                if new_kind.matches_semantics(&other_kind) {
+                    thread.history.remove(index);
+                    compacted = true;
+                } else {
+                    replay_end = Some(index);
+                }
+            }
+        }
+        recompute_thread_config(thread);
+    }
+
+    let _ = compacted;
+    enqueue_replay_from_index(
+        app,
+        command_index + 1,
+        replay_end,
+        runtime,
+        tools,
+        app_tx,
+    )
+    .await
+}
+
+async fn delete_history_entry(
+    app: &mut AppState,
+    target_id: u64,
+    runtime: &runtime::Runtime,
+    tools: &[ToolSpec],
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) -> std_io::Result<()> {
+    let replay_start_index = {
+        let thread = active_thread_mut(app);
+        let Some(index) = find_history_index(thread, target_id) else {
+            return Ok(());
+        };
+
+        if matches!(
+            thread.history.get(index + 1).map(|item| &item.entry),
+            Some(HistoryEntry::LoadingModel { .. })
+        ) {
+            thread.history.remove(index + 1);
+        }
+
+        let replay_start_index = match thread.history[index].entry {
+            HistoryEntry::Assistant { .. } => Some(index),
+            HistoryEntry::Command { .. } | HistoryEntry::Break => Some(index),
+            HistoryEntry::LoadingModel { .. } | HistoryEntry::SystemNotice(_) => None,
+        };
+
+        thread.history.remove(index);
+        recompute_thread_config(thread);
+        replay_start_index
+    };
+
+    if let Some(start_index) = replay_start_index {
+        enqueue_replay_from_index(app, start_index, None, runtime, tools, app_tx).await?;
+    }
+    Ok(())
+}
+
+async fn submit_chat_turn(
+    app: &mut AppState,
+    input: String,
+    runtime: &runtime::Runtime,
+    tools: &[ToolSpec],
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) -> std_io::Result<()> {
+    let compose_target = active_thread(app).compose_target;
+    match compose_target {
+        ComposeTarget::EditEntry(entry_id) => {
+            let thread = active_thread_mut(app);
+            if let Some(index) = find_history_index(thread, entry_id) {
+                if let HistoryEntry::Assistant {
+                    prompt,
+                    content,
+                    callouts,
+                    status,
+                    ..
+                } = &mut thread.history[index].entry
+                {
+                    *prompt = input;
+                    content.clear();
+                    callouts.clear();
+                    *status = Some(AssistantStatus::Queued {
+                        started_at: Instant::now(),
+                    });
+                }
+                thread.selected_chat_entry = Some(index);
+                thread.queue.clear();
+            }
+            if let Some(index) = active_thread(app)
+                .history
+                .iter()
+                .position(|item| item.id == entry_id)
+            {
+                enqueue_replay_from_index(app, index, None, runtime, tools, app_tx).await?;
+            }
+        }
+        ComposeTarget::AppendBottom => {
+            let assistant_id = next_history_id(app);
+            let model_id = active_thread(app).current_config.model_id.clone();
+            {
+                let thread = active_thread_mut(app);
+                insert_pending_assistant_turn(thread, assistant_id, model_id, input);
+                thread.selected_chat_entry = None;
+            }
+            queue_generation_for_turn(app, assistant_id, runtime, tools, app_tx).await?;
+        }
+    }
+
+    active_thread_mut(app).compose_target = ComposeTarget::AppendBottom;
+    app.mode = Mode::Insert;
+    Ok(())
+}
+
+async fn queue_generation_for_turn(
+    app: &mut AppState,
+    assistant_id: u64,
+    runtime: &runtime::Runtime,
+    tools: &[ToolSpec],
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) -> std_io::Result<()> {
+    let (assistant_index, model_id, needs_load) = {
+        let thread = active_thread(app);
+        let Some(index) = find_history_index(thread, assistant_id) else {
+            return Ok(());
+        };
+        let model_id = match &thread.history[index].entry {
+            HistoryEntry::Assistant { model_id, .. } => model_id.clone(),
+            _ => return Ok(()),
+        };
+        let needs_load = !thread.loaded_models.contains(&model_id);
+        (index, model_id, needs_load)
+    };
+
+    let loading_id = next_history_id(app);
+    {
+        let thread = active_thread_mut(app);
+        if needs_load
+            && !matches!(
+                thread.history.get(assistant_index.saturating_sub(1)).map(|item| &item.entry),
+                Some(HistoryEntry::LoadingModel { model_id: prev_model, .. }) if prev_model == &model_id
+            )
+        {
+            maybe_insert_loading_entry(thread, assistant_index, loading_id);
+        }
+        if needs_load {
+            set_loading_status(
+                thread,
+                &model_id,
+                ModelLoadStatus::Loading {
+                    started_at: Instant::now(),
+                },
+            );
+        }
+        thread.queue.push_back(ThreadJob {
+            assistant_entry_id: assistant_id,
+        });
+    }
+    maybe_start_next_job(app, runtime, tools, app_tx).await
+}
+
+async fn enqueue_replay_from_index(
+    app: &mut AppState,
+    start_index: usize,
+    replay_end: Option<usize>,
+    runtime: &runtime::Runtime,
+    tools: &[ToolSpec],
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) -> std_io::Result<()> {
+    let effective_end = {
+        let thread = active_thread(app);
+        replay_end.unwrap_or(thread.history.len())
+    };
+    let assistant_jobs = {
+        let thread = active_thread(app);
+        (start_index..effective_end)
+            .filter_map(|index| {
+                thread.history.get(index).and_then(|item| match &item.entry {
+                    HistoryEntry::Assistant { model_id, .. } => {
+                        Some((index, item.id, model_id.clone()))
+                    }
+                    _ => None,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut loading_insertions = Vec::new();
+    {
+        let thread = active_thread_mut(app);
+        thread.queue.clear();
+        for (index, assistant_id, model_id) in &assistant_jobs {
+            if !thread.loaded_models.contains(model_id)
+                && !matches!(
+                    thread.history.get(index.saturating_sub(1)).map(|item| &item.entry),
+                    Some(HistoryEntry::LoadingModel { model_id: prev_model, .. }) if prev_model == model_id
+                )
+            {
+                loading_insertions.push((*index, model_id.clone()));
+            }
+            if let Some(item) = thread.history.get_mut(*index) {
+                if let HistoryEntry::Assistant {
+                    content,
+                    callouts,
+                    status,
+                    ..
+                } = &mut item.entry
+                {
+                    content.clear();
+                    callouts.clear();
+                    *status = Some(AssistantStatus::Queued {
+                        started_at: Instant::now(),
+                    });
+                }
+            }
+            thread.queue.push_back(ThreadJob {
+                assistant_entry_id: *assistant_id,
+            });
+        }
+    }
+
+    let mut loading_insertions = loading_insertions
+        .into_iter()
+        .map(|(index, model_id)| (index, model_id, next_history_id(app)))
+        .collect::<Vec<_>>();
+    loading_insertions.sort_by(|left, right| right.0.cmp(&left.0));
+    {
+        let thread = active_thread_mut(app);
+        for (index, model_id, loading_id) in loading_insertions {
+            maybe_insert_loading_entry(thread, index, loading_id);
+            set_loading_status(
+                thread,
+                &model_id,
+                ModelLoadStatus::Loading {
+                    started_at: Instant::now(),
+                },
+            );
+        }
+    }
+
+    maybe_start_next_job(app, runtime, tools, app_tx).await
+}
+
+async fn maybe_start_next_job(
+    app: &mut AppState,
+    runtime: &runtime::Runtime,
+    tools: &[ToolSpec],
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) -> std_io::Result<()> {
+    let active_tab_id = active_thread(app).tab_id;
+    let Some(thread_index) = thread_index_by_tab_id(app, active_tab_id) else {
+        return Ok(());
+    };
+    start_next_job_for_thread(app, thread_index, runtime, tools, app_tx).await
+}
+
+async fn start_next_job_for_thread(
+    app: &mut AppState,
+    thread_index: usize,
+    runtime: &runtime::Runtime,
+    tools: &[ToolSpec],
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) -> std_io::Result<()> {
+    let Some(job) = app.threads[thread_index].queue.pop_front() else {
+        return Ok(());
+    };
+    if app.threads[thread_index].running_job {
+        app.threads[thread_index].queue.push_front(job);
+        return Ok(());
+    }
+
+    let tab_id = app.threads[thread_index].tab_id;
+    let (request, config, tool_format) =
+        build_request_for_turn(&app.threads[thread_index], job.assistant_entry_id, tools)?;
+    ensure_thread_connection(&mut app.threads[thread_index], runtime, &config.model_id).await?;
+    let connection = app.threads[thread_index]
+        .connections
+        .get(&config.model_id)
+        .expect("connection should exist")
+        .clone();
+    app.threads[thread_index].running_job = true;
+    if !app.threads[thread_index]
+        .loaded_models
+        .contains(&config.model_id)
+    {
+        set_loading_status(
+            &mut app.threads[thread_index],
+            &config.model_id,
+            ModelLoadStatus::Loading {
+                started_at: Instant::now(),
+            },
+        );
+    }
+
+    let tools = tools.to_vec();
+    tokio::spawn(async move {
+        let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+        let mut stream = match connection
+            .stream_with_status(request, Some(status_tx))
+            .await
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                let _ = app_tx.send(AppEvent::Job(JobEvent::Error {
+                    tab_id,
+                    assistant_entry_id: job.assistant_entry_id,
+                    error: format!("runtime error: {err}"),
+                }));
+                return;
+            }
+        };
+
+        let mut response = String::new();
+        loop {
+            tokio::select! {
+                status = status_rx.recv() => {
+                    if let Some(status) = status {
+                        let _ = app_tx.send(AppEvent::Job(JobEvent::Status {
+                            tab_id,
+                            assistant_entry_id: job.assistant_entry_id,
+                            status,
+                        }));
+                    }
+                }
+                event = stream.next() => {
+                    match event {
+                        Some(RuntimeResponseEvent::Chunk { content, .. }) => {
+                            response.push_str(&content);
+                            let _ = app_tx.send(AppEvent::Job(JobEvent::Chunk {
+                                tab_id,
+                                assistant_entry_id: job.assistant_entry_id,
+                                content,
+                            }));
+                        }
+                        Some(RuntimeResponseEvent::Complete { .. }) => {
+                            let callouts = if config.tools_enabled {
+                                parsed_tool_callouts(tool_format.parse(&response), &tools)
+                            } else {
+                                Vec::new()
+                            };
+                            let _ = app_tx.send(AppEvent::Job(JobEvent::Complete {
+                                tab_id,
+                                assistant_entry_id: job.assistant_entry_id,
+                                callouts,
+                            }));
+                            break;
+                        }
+                        Some(RuntimeResponseEvent::Error { error, .. }) => {
+                            let _ = app_tx.send(AppEvent::Job(JobEvent::Error {
+                                tab_id,
+                                assistant_entry_id: job.assistant_entry_id,
+                                error: format!("runtime error: {error}"),
+                            }));
+                            break;
+                        }
+                        None => {
+                            let _ = app_tx.send(AppEvent::Job(JobEvent::Error {
+                                tab_id,
+                                assistant_entry_id: job.assistant_entry_id,
+                                error: String::from("runtime stream closed"),
+                            }));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(())
+}
+
+async fn handle_job_event(
+    event: JobEvent,
+    app: &mut AppState,
+    runtime: &runtime::Runtime,
+    tools: &[ToolSpec],
+    app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
-    if matches!(*mode, Mode::Command) {
+    let Some(thread_index) = thread_index_by_tab_id(app, event.tab_id()) else {
+        return;
+    };
+    match event {
+        JobEvent::Status {
+            assistant_entry_id,
+            status,
+            ..
+        } => {
+            let thread = &mut app.threads[thread_index];
+            let model_id = match thread
+                .history
+                .iter()
+                .find(|item| item.id == assistant_entry_id)
+                .and_then(|item| match &item.entry {
+                    HistoryEntry::Assistant { model_id, .. } => Some(model_id.clone()),
+                    _ => None,
+                }) {
+                Some(model_id) => model_id,
+                None => return,
+            };
+            match status {
+                RuntimeStatus::Queued { .. } => {
+                    set_assistant_status(
+                        thread,
+                        assistant_entry_id,
+                        AssistantStatus::Queued {
+                            started_at: Instant::now(),
+                        },
+                    );
+                }
+                RuntimeStatus::Loading { .. } => {
+                    set_loading_status(
+                        thread,
+                        &model_id,
+                        ModelLoadStatus::Loading {
+                            started_at: Instant::now(),
+                        },
+                    );
+                    set_assistant_status(
+                        thread,
+                        assistant_entry_id,
+                        AssistantStatus::Loading {
+                            started_at: Instant::now(),
+                        },
+                    );
+                }
+                RuntimeStatus::Generating { .. } => {
+                    thread.loaded_models.insert(model_id.clone());
+                    set_loading_status(thread, &model_id, ModelLoadStatus::Loaded);
+                    set_assistant_status(
+                        thread,
+                        assistant_entry_id,
+                        AssistantStatus::Generating {
+                            started_at: Instant::now(),
+                        },
+                    );
+                }
+            }
+        }
+        JobEvent::Chunk {
+            assistant_entry_id,
+            content,
+            ..
+        } => {
+            append_assistant_chunk(&mut app.threads[thread_index], assistant_entry_id, &content);
+        }
+        JobEvent::Complete {
+            assistant_entry_id,
+            callouts,
+            ..
+        } => {
+            finalize_assistant(&mut app.threads[thread_index], assistant_entry_id, callouts);
+            app.threads[thread_index].running_job = false;
+            let _ = start_next_job_for_thread(app, thread_index, runtime, tools, app_tx).await;
+        }
+        JobEvent::Error {
+            assistant_entry_id,
+            error,
+            ..
+        } => {
+            finalize_assistant(
+                &mut app.threads[thread_index],
+                assistant_entry_id,
+                Vec::new(),
+            );
+            let notice_id = next_history_id(app);
+            push_history_entry(
+                &mut app.threads[thread_index],
+                notice_id,
+                HistoryEntry::SystemNotice(error),
+                HistoryMeta::None,
+            );
+            app.threads[thread_index].running_job = false;
+            let _ = start_next_job_for_thread(app, thread_index, runtime, tools, app_tx).await;
+        }
+    }
+}
+
+fn redraw(ui: &mut TerminalUi, app: &AppState) -> std_io::Result<()> {
+    let thread = active_thread(app);
+    ui.draw(RenderState {
+        entries: &history_entries(thread),
+        selected_chat_entry: thread.selected_chat_entry,
+        mode: app.mode,
+        draft: &thread.draft,
+        prompt_inline: matches!(app.mode, Mode::Insert)
+            && matches!(thread.compose_target, ComposeTarget::EditEntry(_)),
+        scroll_anchor: thread.scroll_anchor,
+        command_palette: matches!(app.mode, Mode::Command).then(|| app.command_palette.view()),
+        tabs: &tab_render_info(&app.threads),
+        active_tab: app.active_thread_idx,
+        delete_confirmation: matches!(app.mode, Mode::ConfirmDelete)
+            .then_some("Confirmation: delete message [y/n]"),
+    })
+}
+
+fn build_request_for_turn(
+    thread: &ThreadState,
+    assistant_entry_id: u64,
+    tools: &[ToolSpec],
+) -> std_io::Result<(RequestBuilder, ThreadConfig, agent::ToolFormat)> {
+    let Some(target_index) = find_history_index(thread, assistant_entry_id) else {
+        return Err(std_io::Error::other("target assistant vanished"));
+    };
+    let effective_config = effective_config_until(thread, target_index);
+
+    let config = effective_config.clone();
+    let registry = runtime::RuntimeRegistry::defaults();
+    let model_config = registry
+        .get(&config.model_id)
+        .ok_or_else(|| std_io::Error::other("unknown runtime config"))?;
+    let tool_format = model_config.model.tool_format();
+    let system_prompt = tool_format.system_prompt(
+        SYSTEM_PROMPT,
+        if config.tools_enabled { tools } else { &[] },
+    );
+    let mut messages =
+        TextMessages::new().add_message(TextMessageRole::System, system_prompt.clone());
+
+    let mut start_index = 0usize;
+    for (index, item) in thread.history.iter().enumerate().take(target_index + 1) {
+        if matches!(item.entry, HistoryEntry::Break) {
+            start_index = index + 1;
+        }
+    }
+
+    for item in thread.history.iter().skip(start_index).take(target_index + 1 - start_index) {
+        match &item.entry {
+            HistoryEntry::Assistant {
+                prompt,
+                content, status, ..
+            } => {
+                messages = messages.add_message(TextMessageRole::User, prompt);
+                if status.is_none() {
+                    messages = messages.add_message(TextMessageRole::Assistant, content);
+                }
+            }
+            HistoryEntry::LoadingModel { .. } => {}
+            HistoryEntry::Command { .. } | HistoryEntry::Break | HistoryEntry::SystemNotice(_) => {}
+        }
+    }
+
+    tracing::info!(
+        max_generation_tokens = MAX_GENERATION_TOKENS,
+        message_count = messages.messages_ref().len(),
+        model = %config.model_id,
+        tools_enabled = config.tools_enabled,
+        "building chat generation request"
+    );
+
+    Ok((
+        RequestBuilder::from(messages).set_sampler_max_len(MAX_GENERATION_TOKENS),
+        config,
+        tool_format,
+    ))
+}
+
+fn effective_config_until(thread: &ThreadState, target_index: usize) -> ThreadConfig {
+    let mut config = thread.base_config.clone();
+    for item in thread.history.iter().take(target_index + 1) {
+        if let HistoryMeta::Command(kind) = &item.meta {
+            match kind {
+                CommandKind::Model(model_id) => config.model_id = model_id.clone(),
+                CommandKind::Tools(enabled) => config.tools_enabled = *enabled,
+                CommandKind::ModelList => {}
+            }
+        }
+    }
+    config
+}
+
+fn recompute_thread_config(thread: &mut ThreadState) {
+    let mut config = thread.base_config.clone();
+    for item in &thread.history {
+        if let HistoryMeta::Command(kind) = &item.meta {
+            match kind {
+                CommandKind::Model(model_id) => config.model_id = model_id.clone(),
+                CommandKind::Tools(enabled) => config.tools_enabled = *enabled,
+                CommandKind::ModelList => {}
+            }
+        }
+    }
+    thread.current_config = config;
+}
+
+async fn ensure_thread_connection(
+    thread: &mut ThreadState,
+    runtime: &runtime::Runtime,
+    model_id: &str,
+) -> std_io::Result<()> {
+    if thread.connections.contains_key(model_id) {
+        return Ok(());
+    }
+    let connection = runtime
+        .open_connection(model_id)
+        .await
+        .map_err(|err| std_io::Error::other(err.to_string()))?;
+    thread.connections.insert(model_id.to_string(), connection);
+    Ok(())
+}
+
+fn parsed_tool_callouts(tool_calls: Vec<agent::ToolCall>, tools: &[ToolSpec]) -> Vec<String> {
+    let allowed_tool_names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<HashSet<_>>();
+    let mut supported_calls = Vec::new();
+    let mut unsupported_calls = Vec::new();
+    for (index, call) in tool_calls.iter().enumerate() {
+        if allowed_tool_names.contains(call.name.as_str()) {
+            supported_calls.push((index + 1, call));
+        } else {
+            unsupported_calls.push((index + 1, call));
+        }
+    }
+    if supported_calls.is_empty() && unsupported_calls.is_empty() {
+        return Vec::new();
+    }
+    let mut callouts = Vec::new();
+    if !supported_calls.is_empty() {
+        callouts.push(String::from("parsed tool calls:"));
+        for (number, call) in supported_calls {
+            let arguments = serde_json::to_string_pretty(&call.arguments)
+                .unwrap_or_else(|_| call.arguments.to_string());
+            callouts.push(format!("{number}. {}", call.name));
+            callouts.push(arguments);
+        }
+    }
+    if !unsupported_calls.is_empty() {
+        callouts.push(String::from("ignored unsupported tool calls:"));
+        for (number, call) in unsupported_calls {
+            let arguments = serde_json::to_string_pretty(&call.arguments)
+                .unwrap_or_else(|_| call.arguments.to_string());
+            callouts.push(format!("{number}. {}", call.name));
+            callouts.push(arguments);
+        }
+    }
+    callouts
+}
+
+fn render_tab_target(target: &TabTarget) -> String {
+    match target {
+        TabTarget::Id(id) => id.to_string(),
+        TabTarget::Name(name) => name.clone(),
+    }
+}
+
+fn resolve_tab_target(threads: &[ThreadState], target: &TabTarget) -> Option<usize> {
+    match target {
+        TabTarget::Id(id) => threads.iter().position(|thread| thread.tab_id == *id),
+        TabTarget::Name(name) => tab_labels(threads).iter().position(|label| label == name),
+    }
+}
+
+fn tab_render_info(threads: &[ThreadState]) -> Vec<TabRenderInfo> {
+    threads
+        .iter()
+        .zip(tab_labels(threads))
+        .map(|(thread, label)| TabRenderInfo {
+            label: format!("{}. {}", thread.tab_id, label),
+        })
+        .collect()
+}
+
+fn tab_labels(threads: &[ThreadState]) -> Vec<String> {
+    let mut counts = HashMap::<String, usize>::new();
+    for thread in threads
+        .iter()
+        .filter(|thread| thread.name_override.is_none())
+    {
+        *counts
+            .entry(thread.current_config.model_id.clone())
+            .or_default() += 1;
+    }
+    let mut seen = HashMap::<String, usize>::new();
+    threads
+        .iter()
+        .map(|thread| {
+            if let Some(name) = &thread.name_override {
+                return name.clone();
+            }
+            let model_id = thread.current_config.model_id.clone();
+            if counts.get(&model_id).copied().unwrap_or(0) <= 1 {
+                model_id
+            } else {
+                let index = seen.entry(model_id.clone()).or_default();
+                *index += 1;
+                format!("{model_id}-{}", *index)
+            }
+        })
+        .collect()
+}
+
+fn active_thread(app: &AppState) -> &ThreadState {
+    &app.threads[app.active_thread_idx]
+}
+
+fn active_thread_mut(app: &mut AppState) -> &mut ThreadState {
+    &mut app.threads[app.active_thread_idx]
+}
+
+fn history_entries(thread: &ThreadState) -> Vec<HistoryEntry> {
+    thread
+        .history
+        .iter()
+        .map(|item| item.entry.clone())
+        .collect()
+}
+
+fn next_history_id(app: &mut AppState) -> u64 {
+    let id = app.next_history_id;
+    app.next_history_id += 1;
+    id
+}
+
+fn push_history_entry(thread: &mut ThreadState, id: u64, entry: HistoryEntry, meta: HistoryMeta) {
+    thread.history.push(HistoryItem { id, entry, meta });
+}
+
+fn replace_history_entry(
+    thread: &mut ThreadState,
+    entry_id: u64,
+    entry: HistoryEntry,
+    meta: HistoryMeta,
+) {
+    if let Some(index) = find_history_index(thread, entry_id) {
+        thread.history[index].entry = entry;
+        thread.history[index].meta = meta;
+    }
+}
+
+fn find_history_index(thread: &ThreadState, entry_id: u64) -> Option<usize> {
+    thread.history.iter().position(|item| item.id == entry_id)
+}
+
+fn insert_pending_assistant_turn(
+    thread: &mut ThreadState,
+    assistant_id: u64,
+    model_id: String,
+    prompt: String,
+) {
+    insert_assistant_turn_at(
+        thread,
+        thread.history.len(),
+        assistant_id,
+        model_id,
+        prompt,
+        Some(AssistantStatus::Queued {
+            started_at: Instant::now(),
+        }),
+    );
+}
+
+fn insert_assistant_turn_at(
+    thread: &mut ThreadState,
+    index: usize,
+    assistant_id: u64,
+    model_id: String,
+    prompt: String,
+    status: Option<AssistantStatus>,
+) {
+    thread.history.insert(
+        index,
+        HistoryItem {
+            id: assistant_id,
+            entry: HistoryEntry::Assistant {
+                model_id,
+                prompt,
+                content: String::new(),
+                callouts: Vec::new(),
+                status,
+            },
+            meta: HistoryMeta::None,
+        },
+    );
+}
+
+fn maybe_insert_loading_entry(thread: &mut ThreadState, assistant_index: usize, loading_id: u64) {
+    let Some(HistoryEntry::Assistant { model_id, .. }) =
+        thread.history.get(assistant_index).map(|item| &item.entry)
+    else {
+        return;
+    };
+
+    if thread.loaded_models.contains(model_id) {
         return;
     }
 
+    if assistant_index > 0
+        && matches!(
+            thread.history.get(assistant_index - 1).map(|item| &item.entry),
+            Some(HistoryEntry::LoadingModel { model_id: prev_model, .. }) if prev_model == model_id
+        )
+    {
+        return;
+    }
+
+    thread.history.insert(
+        assistant_index,
+        HistoryItem {
+            id: loading_id,
+            entry: HistoryEntry::LoadingModel {
+                model_id: model_id.clone(),
+                status: Some(ModelLoadStatus::Loading {
+                    started_at: Instant::now(),
+                }),
+            },
+            meta: HistoryMeta::None,
+        },
+    );
+}
+
+fn set_loading_status(thread: &mut ThreadState, model_id: &str, status: ModelLoadStatus) {
+    if let Some(item) = thread.history.iter_mut().rev().find(|item| {
+        matches!(
+            item.entry,
+            HistoryEntry::LoadingModel {
+                model_id: ref entry_model_id,
+                ..
+            } if entry_model_id == model_id
+        )
+    }) && let HistoryEntry::LoadingModel { status: entry_status, .. } = &mut item.entry
+    {
+        *entry_status = Some(status);
+    }
+}
+
+fn set_assistant_status(thread: &mut ThreadState, assistant_id: u64, status: AssistantStatus) {
+    if let Some(index) = find_history_index(thread, assistant_id) {
+        if let HistoryEntry::Assistant {
+            status: entry_status,
+            ..
+        } = &mut thread.history[index].entry
+        {
+            *entry_status = Some(status);
+        }
+    }
+}
+
+fn append_assistant_chunk(thread: &mut ThreadState, assistant_id: u64, content: &str) {
+    if let Some(index) = find_history_index(thread, assistant_id) {
+        if let HistoryEntry::Assistant {
+            content: assistant_content,
+            status,
+            ..
+        } = &mut thread.history[index].entry
+        {
+            *status = None;
+            assistant_content.push_str(content);
+        }
+    }
+}
+
+fn finalize_assistant(thread: &mut ThreadState, assistant_id: u64, callouts: Vec<String>) {
+    if let Some(index) = find_history_index(thread, assistant_id) {
+        if let HistoryEntry::Assistant {
+            callouts: entry_callouts,
+            status,
+            ..
+        } = &mut thread.history[index].entry
+        {
+            *status = None;
+            entry_callouts.extend(callouts);
+        }
+    }
+}
+
+fn normalize_selection(thread: &mut ThreadState) {
+    sync_loaded_model_entries(thread);
+    let positions = chat_entry_positions(&history_entries(thread));
+    match (thread.selected_chat_entry, positions.len()) {
+        (_, 0) => thread.selected_chat_entry = None,
+        (Some(selected), len) if selected >= len => thread.selected_chat_entry = Some(len - 1),
+        (None, len) if len > 0 && !matches!(thread.compose_target, ComposeTarget::AppendBottom) => {
+            thread.selected_chat_entry = Some(len - 1)
+        }
+        _ => {}
+    }
+}
+
+fn sync_loaded_model_entries(thread: &mut ThreadState) {
+    let loaded_models = thread.loaded_models.clone();
+    for item in &mut thread.history {
+        if let HistoryEntry::LoadingModel { model_id, status } = &mut item.entry
+            && loaded_models.contains(model_id)
+        {
+            *status = Some(ModelLoadStatus::Loaded);
+        }
+    }
+}
+
+fn move_selection(thread: &ThreadState, delta: isize) -> Option<usize> {
+    let chat_positions = chat_entry_positions(&history_entries(thread));
+    if chat_positions.is_empty() {
+        return None;
+    }
+    let current = thread
+        .selected_chat_entry
+        .unwrap_or(chat_positions.len() - 1) as isize;
+    let next = (current + delta).clamp(0, chat_positions.len().saturating_sub(1) as isize);
+    Some(next as usize)
+}
+
+fn exit_insert_mode(thread: &mut ThreadState) {
+    thread.draft.clear();
+    thread.compose_target = ComposeTarget::AppendBottom;
+    thread.selected_chat_entry = move_selection(thread, 0);
+}
+
+fn open_footer_compose(app: &mut AppState) {
+    let thread = active_thread_mut(app);
+    thread.selected_chat_entry = None;
+    thread.compose_target = ComposeTarget::AppendBottom;
+    thread.draft.clear();
+    app.mode = Mode::Insert;
+}
+
+fn cycle_active_tab(app: &mut AppState) {
+    if app.threads.is_empty() {
+        return;
+    }
+    app.active_thread_idx = (app.active_thread_idx + 1) % app.threads.len();
+}
+
+fn close_command_mode(app: &mut AppState) {
+    app.command_palette.close();
+    app.command_edit_target = None;
+    app.inline_command_placeholder = None;
+    open_footer_compose(app);
+}
+
+fn open_inline_compose_relative(app: &mut AppState, position: InlineComposePosition) {
+    let Some(selected_index) = active_thread(app).selected_chat_entry else {
+        open_footer_compose(app);
+        return;
+    };
+
+    let history_len = active_thread(app).history.len();
+    let insert_index = match position {
+        InlineComposePosition::Before => selected_index,
+        InlineComposePosition::After => selected_index + 1,
+    };
+
+    if matches!(position, InlineComposePosition::After) && insert_index >= history_len {
+        open_footer_compose(app);
+        return;
+    }
+
+    let assistant_id = next_history_id(app);
+    let model_id = active_thread(app).current_config.model_id.clone();
+    let thread = active_thread_mut(app);
+    insert_assistant_turn_at(
+        thread,
+        insert_index,
+        assistant_id,
+        model_id,
+        String::new(),
+        None,
+    );
+    thread.selected_chat_entry = Some(insert_index);
+    thread.compose_target = ComposeTarget::EditEntry(assistant_id);
+    thread.draft.clear();
+    app.mode = Mode::Insert;
+}
+
+fn open_inline_command_relative(app: &mut AppState, position: InlineCommandPosition) {
+    let Some(selected_index) = active_thread(app).selected_chat_entry else {
+        app.command_edit_target = None;
+        app.mode = Mode::Command;
+        app.command_palette.open();
+        return;
+    };
+
+    let history_len = active_thread(app).history.len();
+    let insert_index = match position {
+        InlineCommandPosition::Before => selected_index,
+        InlineCommandPosition::After => selected_index + 1,
+    };
+
+    if matches!(position, InlineCommandPosition::After) && insert_index > history_len {
+        app.mode = Mode::Command;
+        app.command_palette.open();
+        return;
+    }
+
+    let command_id = next_history_id(app);
+    let thread = active_thread_mut(app);
+    thread.history.insert(
+        insert_index,
+        HistoryItem {
+            id: command_id,
+            entry: HistoryEntry::Command {
+                raw: String::new(),
+                result: String::new(),
+            },
+            meta: HistoryMeta::None,
+        },
+    );
+    thread.selected_chat_entry = Some(insert_index);
+    app.command_edit_target = Some(command_id);
+    app.inline_command_placeholder = Some((command_id, selected_index));
+    app.mode = Mode::Command;
+    app.command_palette.open();
+}
+
+fn cancel_inline_command_insert(app: &mut AppState) {
+    let Some((placeholder_id, anchor_index)) = app.inline_command_placeholder.take() else {
+        return;
+    };
+
+    let thread = active_thread_mut(app);
+    if let Some(index) = find_history_index(thread, placeholder_id) {
+        thread.history.remove(index);
+        recompute_thread_config(thread);
+        let len = chat_entry_positions(&history_entries(thread)).len();
+        thread.selected_chat_entry = if len == 0 {
+            None
+        } else {
+            Some(anchor_index.min(len - 1))
+        };
+    }
+}
+
+fn push_command_error(command_palette: &mut CommandPaletteState, err: CommandParseError) {
+    match err {
+        CommandParseError::Empty => {}
+        CommandParseError::Incomplete(message) | CommandParseError::Invalid(message) => {
+            command_palette.set_error(message);
+        }
+    }
+}
+
+fn push_notice_current(app: &mut AppState, message: String) {
+    let id = next_history_id(app);
+    push_history_entry(
+        active_thread_mut(app),
+        id,
+        HistoryEntry::SystemNotice(message),
+        HistoryMeta::None,
+    );
+}
+
+fn selection_edit_action(entry: &HistoryEntry) -> Option<SelectionEditAction> {
+    match entry {
+        HistoryEntry::Assistant { prompt, .. } => {
+            Some(SelectionEditAction::Prompt(prompt.clone()))
+        }
+        HistoryEntry::Command { raw, .. } => Some(SelectionEditAction::Command(raw.clone())),
+        HistoryEntry::Break => Some(SelectionEditAction::Command(String::from("break"))),
+        HistoryEntry::LoadingModel { .. } => None,
+        HistoryEntry::SystemNotice(_) => None,
+    }
+}
+
+fn handle_mouse_event(kind: MouseEventKind, app: &mut AppState) {
+    if matches!(app.mode, Mode::Command | Mode::ConfirmDelete) {
+        return;
+    }
+    let thread = active_thread_mut(app);
     let delta = match kind {
         MouseEventKind::ScrollUp => Some(-1),
         MouseEventKind::ScrollDown => Some(1),
         _ => None,
     };
-
     let Some(delta) = delta else {
         return;
     };
 
-    if matches!(*mode, Mode::Insert) {
-        if delta > 0 {
-            return;
-        }
-        *mode = Mode::Normal;
-        *scroll_anchor = ScrollAnchor::Top;
-        *selected_chat_entry = move_selection(transcript, *selected_chat_entry, delta);
-        return;
-    }
-
-    if delta > 0 && is_at_bottom(transcript, *selected_chat_entry) {
-        *selected_chat_entry = None;
-        *compose_target = ComposeTarget::AppendBottom;
-        *scroll_anchor = ScrollAnchor::Bottom;
-        enter_insert_mode(mode, draft);
-        return;
-    }
-
-    *scroll_anchor = if delta > 0 {
+    thread.scroll_anchor = if delta > 0 {
         ScrollAnchor::Bottom
     } else {
         ScrollAnchor::Top
     };
-    *selected_chat_entry = move_selection(transcript, *selected_chat_entry, delta);
-}
-
-async fn submit_chat_turn(
-    input: String,
-    mode: &mut Mode,
-    selected_chat_entry: &mut Option<usize>,
-    compose_target: &mut ComposeTarget,
-    scroll_anchor: &mut ScrollAnchor,
-    transcript: &mut Vec<TranscriptEntry>,
-    runtime: &runtime::Runtime,
-    active_connection: &mut RuntimeConnection,
-    active_model: &mut String,
-    tools_enabled: bool,
-    tools: &[ToolSpec],
-    ui: &mut TerminalUi,
-) -> std_io::Result<()> {
-    match *compose_target {
-        ComposeTarget::InsertAfterSelection => {
-            replace_selected_chat_entry(transcript, *selected_chat_entry, input);
-        }
-        ComposeTarget::AppendBottom => {
-            transcript.push(TranscriptEntry::User(input));
-        }
-    }
-    transcript.push(TranscriptEntry::System {
-        content: format!("model {active_model} finished loading"),
-        status: Some(SystemStatus::Loading {
-            model_id: active_model.clone(),
-            started_at: Instant::now(),
-        }),
-    });
-    transcript.push(TranscriptEntry::Assistant {
-        model_id: active_model.clone(),
-        content: String::new(),
-        callouts: Vec::new(),
-        status: Some(AssistantStatus::Loading {
-            started_at: Instant::now(),
-        }),
-    });
-
-    *selected_chat_entry = None;
-    *compose_target = ComposeTarget::AppendBottom;
-    *scroll_anchor = ScrollAnchor::Bottom;
-
-    let Some(config) = runtime.config(active_model) else {
-        pop_pending_assistant(transcript);
-        push_system_message(
-            transcript,
-            format!("active model disappeared from registry: {active_model}"),
-        );
-        return Ok(());
-    };
-
-    let request = build_request(
-        transcript,
-        config
-            .model
-            .tool_format()
-            .system_prompt(SYSTEM_PROMPT, if tools_enabled { tools } else { &[] }),
-        tools_enabled,
-    );
-    let tool_format = config.model.tool_format();
-    let (status_tx, mut status_rx) = mpsc::unbounded_channel();
-    let mut response_stream = match active_connection
-        .stream_with_status(request, Some(status_tx))
-        .await
-    {
-        Ok(stream) => stream,
-        Err(err) => {
-            pop_pending_assistant(transcript);
-            push_system_message(transcript, format!("runtime error: {err}"));
-            return Ok(());
-        }
-    };
-
-    let mut response = String::new();
-    let mut completed = false;
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-
-    if let Err(err) = redraw(
-        ui,
-        transcript,
-        *selected_chat_entry,
-        *mode,
-        "",
-        *compose_target,
-        *scroll_anchor,
-        None,
-    ) {
-        push_system_message(transcript, format!("failed to render loading state: {err}"));
-    }
-
-    loop {
-        tokio::select! {
-            _ = &mut ctrl_c => {
-                runtime.request_shutdown();
-                return Err(std_io::Error::new(ErrorKind::Interrupted, "ctrl-c"));
-            }
-            _ = tick.tick() => {
-                if let Err(err) = redraw(
-                    ui,
-                    transcript,
-                    *selected_chat_entry,
-                    *mode,
-                    "",
-                    *compose_target,
-                    *scroll_anchor,
-                    None,
-                ) {
-                    push_system_message(transcript, format!("failed to refresh spinner: {err}"));
-                    break;
-                }
-            }
-            status = status_rx.recv() => {
-                if let Some(status) = status {
-                    apply_runtime_status(transcript, status);
-                    if let Err(err) = redraw(
-                        ui,
-                        transcript,
-                        *selected_chat_entry,
-                        *mode,
-                        "",
-                        *compose_target,
-                        *scroll_anchor,
-                        None,
-                    ) {
-                        push_system_message(transcript, format!("failed to render status: {err}"));
-                        break;
-                    }
-                }
-            }
-            event = response_stream.next() => {
-                match event {
-                    Some(RuntimeResponseEvent::Chunk { content, .. }) => {
-                        response.push_str(&content);
-                        append_assistant_chunk(transcript, &content);
-                        if let Err(err) = redraw(
-                            ui,
-                            transcript,
-                            *selected_chat_entry,
-                            *mode,
-                            "",
-                            *compose_target,
-                            *scroll_anchor,
-                            None,
-                        ) {
-                            push_system_message(transcript, format!("failed to render response chunk: {err}"));
-                            break;
-                        }
-                    }
-                    Some(RuntimeResponseEvent::Complete { .. }) => {
-                        completed = true;
-                        clear_pending_status(transcript);
-                        if let Err(err) = redraw(
-                            ui,
-                            transcript,
-                            *selected_chat_entry,
-                            *mode,
-                            "",
-                            *compose_target,
-                            *scroll_anchor,
-                            None,
-                        ) {
-                            push_system_message(transcript, format!("failed to finalize response: {err}"));
-                        }
-                        break;
-                    }
-                    Some(RuntimeResponseEvent::Error { error, .. }) => {
-                        clear_pending_status(transcript);
-                        push_system_message(transcript, format!("runtime error: {error}"));
-                        if let Err(err) = redraw(
-                            ui,
-                            transcript,
-                            *selected_chat_entry,
-                            *mode,
-                            "",
-                            *compose_target,
-                            *scroll_anchor,
-                            None,
-                        ) {
-                            push_system_message(transcript, format!("failed to render runtime error: {err}"));
-                        }
-                        break;
-                    }
-                    None => {
-                        clear_pending_status(transcript);
-                        if let Err(err) = redraw(
-                            ui,
-                            transcript,
-                            *selected_chat_entry,
-                            *mode,
-                            "",
-                            *compose_target,
-                            *scroll_anchor,
-                            None,
-                        ) {
-                            push_system_message(transcript, format!("failed to render closed stream: {err}"));
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if completed {
-        let tool_calls = tool_format.parse(&response);
-        if tools_enabled && !tool_calls.is_empty() {
-            append_tool_calls(transcript, &tool_calls, tools);
-        }
-    }
-
-    *mode = Mode::Insert;
-    *compose_target = ComposeTarget::AppendBottom;
-    if let Err(err) = redraw(
-        ui,
-        transcript,
-        *selected_chat_entry,
-        *mode,
-        "",
-        *compose_target,
-        *scroll_anchor,
-        None,
-    ) {
-        push_system_message(
-            transcript,
-            format!("failed to redraw after response: {err}"),
-        );
-    }
-
-    Ok(())
-}
-
-fn apply_runtime_status(transcript: &mut [TranscriptEntry], status: RuntimeStatus) {
-    match status {
-        RuntimeStatus::Queued { config_id } => {
-            if let Some(TranscriptEntry::Assistant {
-                model_id, status, ..
-            }) = pending_assistant_entry_mut(transcript)
-            {
-                *status = Some(AssistantStatus::Loading {
-                    started_at: Instant::now(),
-                });
-                tracing::info!(model = %model_id, queued = true, "generation queued");
-            }
-
-            tracing::debug!(model = %config_id, "runtime request queued");
-        }
-        RuntimeStatus::Loading { config_id, .. } => {
-            if let Some(TranscriptEntry::System { content, status }) =
-                pending_loading_system_entry_mut(transcript)
-            {
-                *content = format!("model {config_id} finished loading");
-                *status = Some(SystemStatus::Loading {
-                    model_id: config_id.clone(),
-                    started_at: Instant::now(),
-                });
-            }
-
-            if let Some(TranscriptEntry::Assistant { status, .. }) =
-                pending_assistant_entry_mut(transcript)
-            {
-                *status = Some(AssistantStatus::Loading {
-                    started_at: Instant::now(),
-                });
-            }
-        }
-        RuntimeStatus::Generating { config_id } => {
-            clear_pending_loading_system_status(transcript, &config_id);
-
-            if let Some(TranscriptEntry::Assistant {
-                model_id,
-                content,
-                callouts: _,
-                status,
-            }) = pending_assistant_entry_mut(transcript)
-            {
-                *status = Some(AssistantStatus::Generating {
-                    started_at: Instant::now(),
-                });
-
-                if content.is_empty() {
-                    tracing::debug!(model = %model_id, "generation spinner active");
-                }
-            }
-        }
+    thread.selected_chat_entry = move_selection(thread, delta);
+    if matches!(app.mode, Mode::Insert) && delta < 0 {
+        app.mode = Mode::Normal;
     }
 }
 
-fn clear_pending_status(transcript: &mut [TranscriptEntry]) {
-    if let Some(TranscriptEntry::Assistant { status, .. }) = pending_assistant_entry_mut(transcript)
-    {
-        *status = None;
-    }
-    clear_latest_loading_system_status(transcript);
-}
-
-fn pop_pending_assistant(transcript: &mut Vec<TranscriptEntry>) {
-    if matches!(
-        transcript.last(),
-        Some(TranscriptEntry::Assistant {
-            status: Some(_),
-            ..
-        })
-    ) {
-        transcript.pop();
-    }
-}
-
-fn append_assistant_chunk(transcript: &mut [TranscriptEntry], content: &str) {
-    if let Some(TranscriptEntry::Assistant {
-        content: assistant_content,
-        callouts: _,
-        status,
-        ..
-    }) = pending_assistant_entry_mut(transcript)
-    {
-        *status = None;
-        assistant_content.push_str(content);
-    }
-}
-
-fn pending_assistant_entry_mut(transcript: &mut [TranscriptEntry]) -> Option<&mut TranscriptEntry> {
-    transcript
-        .iter_mut()
-        .rev()
-        .find(|entry| matches!(entry, TranscriptEntry::Assistant { .. }))
-}
-
-fn pending_loading_system_entry_mut(
-    transcript: &mut [TranscriptEntry],
-) -> Option<&mut TranscriptEntry> {
-    transcript.iter_mut().rev().find(|entry| {
-        matches!(
-            entry,
-            TranscriptEntry::System {
-                status: Some(SystemStatus::Loading { .. }),
-                ..
-            }
-        )
-    })
-}
-
-fn clear_pending_loading_system_status(transcript: &mut [TranscriptEntry], model_id: &str) {
-    if let Some(TranscriptEntry::System { status, .. }) =
-        transcript.iter_mut().rev().find(|entry| {
-            matches!(
-                entry,
-                TranscriptEntry::System {
-                    status: Some(SystemStatus::Loading { model_id: entry_model_id, .. }),
-                    ..
-                } if entry_model_id == model_id
-            )
-        })
-    {
-        *status = None;
-    }
-}
-
-fn clear_latest_loading_system_status(transcript: &mut [TranscriptEntry]) {
-    if let Some(TranscriptEntry::System { status, .. }) =
-        pending_loading_system_entry_mut(transcript)
-    {
-        *status = None;
-    }
-}
-
-fn move_selection(
-    transcript: &[TranscriptEntry],
-    selected_chat_entry: Option<usize>,
-    delta: isize,
-) -> Option<usize> {
-    let chat_positions = chat_entry_positions(transcript);
-    if chat_positions.is_empty() {
-        return None;
-    }
-
-    let current = selected_chat_entry.unwrap_or(chat_positions.len() - 1) as isize;
-    let next = (current + delta).clamp(0, chat_positions.len().saturating_sub(1) as isize);
-    Some(next as usize)
-}
-
-fn is_at_bottom(transcript: &[TranscriptEntry], selected_chat_entry: Option<usize>) -> bool {
-    let chat_positions = chat_entry_positions(transcript);
-    match (chat_positions.len(), selected_chat_entry) {
-        (0, _) => true,
-        (len, Some(selected)) => selected + 1 >= len,
-        (_, None) => true,
-    }
-}
-
-fn enter_insert_mode(mode: &mut Mode, draft: &mut String) {
-    *mode = Mode::Insert;
-    draft.clear();
-}
-
-fn exit_insert_mode(
-    mode: &mut Mode,
-    selected_chat_entry: &mut Option<usize>,
-    compose_target: ComposeTarget,
-    transcript: &[TranscriptEntry],
-) {
-    *mode = Mode::Normal;
-    match compose_target {
-        ComposeTarget::InsertAfterSelection => {}
-        ComposeTarget::AppendBottom => {
-            *selected_chat_entry = move_selection(transcript, None, 0);
-        }
-    }
-}
-
-fn open_footer_compose(
-    mode: &mut Mode,
-    selected_chat_entry: &mut Option<usize>,
-    compose_target: &mut ComposeTarget,
-    draft: &mut String,
-) {
-    *selected_chat_entry = None;
-    *compose_target = ComposeTarget::AppendBottom;
-    enter_insert_mode(mode, draft);
-}
-
-fn open_compose_after_selection(
-    transcript: &[TranscriptEntry],
-    selected_chat_entry: &mut Option<usize>,
-    compose_target: &mut ComposeTarget,
-    mode: &mut Mode,
-    draft: &mut String,
-) {
-    let editable_selection = next_editable_selection_after(transcript, *selected_chat_entry);
-    let editable_positions = editable_entry_positions(transcript);
-    let can_insert_after_selection = editable_selection
-        .and_then(|selection| {
-            editable_positions
-                .iter()
-                .position(|candidate| *candidate == selection)
-        })
-        .is_some_and(|position| position + 1 < editable_positions.len());
-
-    if can_insert_after_selection {
-        *selected_chat_entry = editable_selection;
-        *compose_target = ComposeTarget::InsertAfterSelection;
-    } else {
-        *compose_target = ComposeTarget::AppendBottom;
-        *selected_chat_entry = None;
-    }
-
-    enter_insert_mode(mode, draft);
-}
-
-fn next_editable_selection_after(
-    transcript: &[TranscriptEntry],
-    selected_chat_entry: Option<usize>,
-) -> Option<usize> {
-    let selected = selected_transcript_index(transcript, selected_chat_entry)?;
-    editable_entry_positions(transcript)
-        .into_iter()
-        .find(|position| *position > selected)
-}
-
-fn open_inline_compose_for_selection(
-    transcript: &[TranscriptEntry],
-    selected_chat_entry: &mut Option<usize>,
-    compose_target: &mut ComposeTarget,
-    mode: &mut Mode,
-    draft: &mut String,
-) {
-    if let Some(editable_selection) =
-        selected_editable_transcript_index(transcript, *selected_chat_entry)
-    {
-        *selected_chat_entry = Some(editable_selection);
-        *compose_target = ComposeTarget::InsertAfterSelection;
-        *mode = Mode::Insert;
-        draft.clear();
-        draft.push_str(&editable_entry_content(&transcript[editable_selection]));
-    }
-}
-
-fn normalize_selection(transcript: &[TranscriptEntry], selected_chat_entry: &mut Option<usize>) {
-    let chat_positions = chat_entry_positions(transcript);
-    match (*selected_chat_entry, chat_positions.len()) {
-        (_, 0) => *selected_chat_entry = None,
-        (Some(selected), len) if selected >= len => *selected_chat_entry = Some(len - 1),
-        (None, len) => *selected_chat_entry = Some(len - 1),
-        _ => {}
-    }
-}
-
-fn yank_entry(entry: &TranscriptEntry) -> std_io::Result<()> {
+fn yank_entry(entries: &[HistoryEntry], index: usize) -> std_io::Result<()> {
     let mut clipboard = Clipboard::new().map_err(|err| std_io::Error::other(err.to_string()))?;
     clipboard
-        .set_text(clipboard_text(entry))
+        .set_text(clipboard_text(entries, index))
         .map_err(|err| std_io::Error::other(err.to_string()))
 }
 
-fn editable_entry_content(entry: &TranscriptEntry) -> String {
-    match entry {
-        TranscriptEntry::User(content) => content.clone(),
-        TranscriptEntry::Assistant { content, .. } => content.clone(),
-        TranscriptEntry::System { .. } => String::new(),
+fn thread_index_by_tab_id(app: &AppState, tab_id: usize) -> Option<usize> {
+    app.threads
+        .iter()
+        .position(|thread| thread.tab_id == tab_id)
+}
+
+async fn close_thread_connections(thread: &mut ThreadState) {
+    for (_, connection) in thread.connections.drain() {
+        let _ = connection.end_connection().await;
     }
 }
 
-fn redraw(
-    ui: &mut TerminalUi,
-    transcript: &[TranscriptEntry],
-    selected_chat_entry: Option<usize>,
-    mode: Mode,
-    draft: &str,
-    compose_target: ComposeTarget,
-    scroll_anchor: ScrollAnchor,
-    command_palette: Option<CommandPaletteView<'_>>,
-) -> std_io::Result<()> {
-    ui.draw(RenderState {
-        entries: transcript,
-        selected_chat_entry,
-        mode,
-        draft,
-        prompt_inline: matches!(mode, Mode::Insert)
-            && matches!(compose_target, ComposeTarget::InsertAfterSelection),
-        scroll_anchor,
-        command_palette,
-    })
+async fn shutdown_connections(app: &mut AppState) {
+    for thread in &mut app.threads {
+        close_thread_connections(thread).await;
+    }
 }
 
-fn start_event_reader(tx: mpsc::UnboundedSender<Event>) -> thread::JoinHandle<()> {
+fn start_event_reader(tx: mpsc::UnboundedSender<AppEvent>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         loop {
             match event::read() {
                 Ok(event) => {
-                    if tx.send(event).is_err() {
+                    if tx.send(AppEvent::Input(event)).is_err() {
                         break;
                     }
                 }
@@ -1101,6 +1934,18 @@ fn start_event_reader(tx: mpsc::UnboundedSender<Event>) -> thread::JoinHandle<()
                     tracing::error!(error = %err, "failed to read terminal event");
                     break;
                 }
+            }
+        }
+    })
+}
+
+fn start_tick_loop(tx: mpsc::UnboundedSender<AppEvent>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            interval.tick().await;
+            if tx.send(AppEvent::Tick).is_err() {
+                break;
             }
         }
     })
@@ -1172,9 +2017,7 @@ where
                 print_usage();
                 std::process::exit(0);
             }
-            _ => {
-                return Err(format!("unrecognized argument: {arg}"));
-            }
+            _ => return Err(format!("unrecognized argument: {arg}")),
         }
     }
 
@@ -1244,465 +2087,20 @@ fn default_tools() -> Vec<ToolSpec> {
     ]
 }
 
-fn append_tool_calls(
-    transcript: &mut Vec<TranscriptEntry>,
-    tool_calls: &[agent::ToolCall],
-    tools: &[ToolSpec],
-) {
-    let allowed_tool_names = tools
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<HashSet<_>>();
-    let mut supported_calls = Vec::new();
-    let mut unsupported_calls = Vec::new();
-
-    for (index, call) in tool_calls.iter().enumerate() {
-        if allowed_tool_names.contains(call.name.as_str()) {
-            supported_calls.push((index + 1, call));
-        } else {
-            unsupported_calls.push((index + 1, call));
+impl JobEvent {
+    fn tab_id(&self) -> usize {
+        match self {
+            Self::Status { tab_id, .. }
+            | Self::Chunk { tab_id, .. }
+            | Self::Complete { tab_id, .. }
+            | Self::Error { tab_id, .. } => *tab_id,
         }
     }
-
-    if supported_calls.is_empty() && unsupported_calls.is_empty() {
-        return;
-    }
-
-    let mut callouts = Vec::new();
-
-    if !supported_calls.is_empty() {
-        callouts.push(String::from("parsed tool calls:"));
-        for (number, call) in supported_calls {
-            let arguments = serde_json::to_string_pretty(&call.arguments)
-                .unwrap_or_else(|_| call.arguments.to_string());
-
-            callouts.push(format!("{number}. {}", call.name));
-            callouts.push(arguments);
-        }
-    }
-
-    if !unsupported_calls.is_empty() {
-        callouts.push(String::from("ignored unsupported tool calls:"));
-        for (number, call) in unsupported_calls {
-            let arguments = serde_json::to_string_pretty(&call.arguments)
-                .unwrap_or_else(|_| call.arguments.to_string());
-
-            callouts.push(format!("{number}. {}", call.name));
-            callouts.push(arguments);
-        }
-    }
-
-    if let Some(TranscriptEntry::Assistant {
-        callouts: entry_callouts,
-        ..
-    }) = transcript.last_mut()
-    {
-        entry_callouts.extend(callouts);
-    }
-}
-
-fn build_request(
-    transcript: &[TranscriptEntry],
-    system_prompt: String,
-    tools_enabled: bool,
-) -> RequestBuilder {
-    let system_prompt_log = system_prompt.clone();
-    let mut messages = TextMessages::new().add_message(TextMessageRole::System, system_prompt);
-
-    for entry in transcript {
-        match entry {
-            TranscriptEntry::User(content) => {
-                messages = messages.add_message(TextMessageRole::User, content);
-            }
-            TranscriptEntry::Assistant {
-                content, status, ..
-            } if status.is_none() => {
-                messages = messages.add_message(TextMessageRole::Assistant, content);
-            }
-            TranscriptEntry::Assistant { .. } | TranscriptEntry::System { .. } => {}
-        }
-    }
-
-    tracing::info!(
-        max_generation_tokens = MAX_GENERATION_TOKENS,
-        message_count = messages.messages_ref().len(),
-        tools_enabled,
-        "building chat generation request"
-    );
-    tracing::info!(
-        "chat prompt sent to model:\n{}",
-        render_chat_log(transcript, &system_prompt_log)
-    );
-
-    RequestBuilder::from(messages).set_sampler_max_len(MAX_GENERATION_TOKENS)
-}
-
-fn render_chat_log(transcript: &[TranscriptEntry], system_prompt: &str) -> String {
-    let mut output = String::new();
-
-    output.push_str("system:\n");
-    output.push_str(system_prompt);
-
-    for entry in transcript {
-        match entry {
-            TranscriptEntry::User(content) => {
-                output.push_str("\n\n");
-                output.push_str("user:\n");
-                output.push_str(content);
-            }
-            TranscriptEntry::Assistant {
-                model_id,
-                content,
-                status,
-                ..
-            } if status.is_none() => {
-                output.push_str("\n\n");
-                output.push_str("assistant:\n");
-                output.push_str(model_id);
-                output.push('\n');
-                output.push_str(content);
-            }
-            TranscriptEntry::Assistant { .. } | TranscriptEntry::System { .. } => {}
-        }
-    }
-
-    output
-}
-
-fn push_system_message(transcript: &mut Vec<TranscriptEntry>, message: String) {
-    transcript.push(TranscriptEntry::System {
-        content: message,
-        status: None,
-    });
-}
-
-fn is_editable_entry(entry: &TranscriptEntry) -> bool {
-    matches!(
-        entry,
-        TranscriptEntry::User(_) | TranscriptEntry::Assistant { .. }
-    )
-}
-
-fn editable_entry_positions(transcript: &[TranscriptEntry]) -> Vec<usize> {
-    transcript
-        .iter()
-        .enumerate()
-        .filter_map(|(index, entry)| is_editable_entry(entry).then_some(index))
-        .collect()
-}
-
-fn selected_editable_transcript_index(
-    transcript: &[TranscriptEntry],
-    selected_chat_entry: Option<usize>,
-) -> Option<usize> {
-    selected_transcript_index(transcript, selected_chat_entry)
-        .filter(|index| transcript.get(*index).is_some_and(is_editable_entry))
-}
-
-fn truncate_history_for_insertion(
-    transcript: &mut Vec<TranscriptEntry>,
-    selected_chat_entry: Option<usize>,
-) {
-    let insertion_index = selected_editable_transcript_index(transcript, selected_chat_entry)
-        .map(|index| index + 1)
-        .unwrap_or(transcript.len());
-    transcript.truncate(insertion_index);
-}
-
-fn replace_selected_chat_entry(
-    transcript: &mut Vec<TranscriptEntry>,
-    selected_chat_entry: Option<usize>,
-    input: String,
-) {
-    match selected_editable_transcript_index(transcript, selected_chat_entry) {
-        Some(selected_index) => {
-            transcript.truncate(selected_index + 1);
-            transcript[selected_index] = TranscriptEntry::User(input);
-        }
-        None => {
-            transcript.push(TranscriptEntry::User(input));
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppAction {
-    Continue,
-    Quit,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ComposeTarget, Mode, StartupOptions, TranscriptEntry, exit_insert_mode,
-        open_compose_after_selection, open_footer_compose, open_inline_compose_for_selection,
-        parse_startup_args, replace_selected_chat_entry, truncate_history_for_insertion,
-    };
-
-    #[test]
-    fn truncating_for_insertion_removes_tail_after_selected_chat() {
-        let mut transcript = vec![
-            TranscriptEntry::User("first".to_string()),
-            TranscriptEntry::Assistant {
-                model_id: "m".to_string(),
-                content: "second".to_string(),
-                callouts: vec![],
-                status: None,
-            },
-            TranscriptEntry::User("third".to_string()),
-        ];
-
-        truncate_history_for_insertion(&mut transcript, Some(0));
-
-        assert_eq!(transcript.len(), 1);
-        assert!(matches!(transcript[0], TranscriptEntry::User(_)));
-    }
-
-    #[test]
-    fn replacing_selected_chat_entry_overwrites_in_place_and_drops_tail() {
-        let mut transcript = vec![
-            TranscriptEntry::User("first".to_string()),
-            TranscriptEntry::Assistant {
-                model_id: "m".to_string(),
-                content: "second".to_string(),
-                callouts: vec![],
-                status: None,
-            },
-            TranscriptEntry::User("third".to_string()),
-        ];
-
-        replace_selected_chat_entry(&mut transcript, Some(1), "replacement".to_string());
-
-        assert_eq!(transcript.len(), 2);
-        assert!(
-            matches!(transcript[1], TranscriptEntry::User(ref value) if value == "replacement")
-        );
-    }
-
-    #[test]
-    fn open_compose_after_selection_targets_the_next_message_when_available() {
-        let transcript = vec![
-            TranscriptEntry::User("first".to_string()),
-            TranscriptEntry::Assistant {
-                model_id: "m".to_string(),
-                content: "second".to_string(),
-                callouts: vec![],
-                status: None,
-            },
-            TranscriptEntry::User("third".to_string()),
-        ];
-        let mut selected_chat_entry = Some(0);
-        let mut compose_target = ComposeTarget::AppendBottom;
-        let mut mode = Mode::Normal;
-        let mut draft = String::from("old");
-
-        open_compose_after_selection(
-            &transcript,
-            &mut selected_chat_entry,
-            &mut compose_target,
-            &mut mode,
-            &mut draft,
-        );
-
-        assert_eq!(compose_target, ComposeTarget::InsertAfterSelection);
-        assert_eq!(selected_chat_entry, Some(1));
-        assert_eq!(mode, Mode::Insert);
-        assert!(draft.is_empty());
-    }
-
-    #[test]
-    fn open_compose_after_selection_appends_at_bottom_when_at_tail() {
-        let transcript = vec![
-            TranscriptEntry::User("first".to_string()),
-            TranscriptEntry::Assistant {
-                model_id: "m".to_string(),
-                content: "second".to_string(),
-                callouts: vec![],
-                status: None,
-            },
-        ];
-        let mut selected_chat_entry = Some(1);
-        let mut compose_target = ComposeTarget::InsertAfterSelection;
-        let mut mode = Mode::Normal;
-        let mut draft = String::from("old");
-
-        open_compose_after_selection(
-            &transcript,
-            &mut selected_chat_entry,
-            &mut compose_target,
-            &mut mode,
-            &mut draft,
-        );
-
-        assert_eq!(compose_target, ComposeTarget::AppendBottom);
-        assert_eq!(selected_chat_entry, None);
-        assert_eq!(mode, Mode::Insert);
-        assert!(draft.is_empty());
-    }
-
-    #[test]
-    fn open_compose_after_selection_moves_system_selection_to_next_editable_message() {
-        let transcript = vec![
-            TranscriptEntry::System {
-                content: "system".to_string(),
-                status: None,
-            },
-            TranscriptEntry::Assistant {
-                model_id: "m".to_string(),
-                content: "editable".to_string(),
-                callouts: vec![],
-                status: None,
-            },
-            TranscriptEntry::User("tail".to_string()),
-        ];
-        let mut selected_chat_entry = Some(0);
-        let mut compose_target = ComposeTarget::AppendBottom;
-        let mut mode = Mode::Normal;
-        let mut draft = String::from("old");
-
-        open_compose_after_selection(
-            &transcript,
-            &mut selected_chat_entry,
-            &mut compose_target,
-            &mut mode,
-            &mut draft,
-        );
-
-        assert_eq!(selected_chat_entry, Some(1));
-        assert_eq!(compose_target, ComposeTarget::InsertAfterSelection);
-        assert_eq!(mode, Mode::Insert);
-        assert!(draft.is_empty());
-    }
-
-    #[test]
-    fn open_compose_after_selection_appends_at_bottom_when_there_is_no_next_message() {
-        let transcript = vec![
-            TranscriptEntry::User("first".to_string()),
-            TranscriptEntry::Assistant {
-                model_id: "m".to_string(),
-                content: "second".to_string(),
-                callouts: vec![],
-                status: None,
-            },
-        ];
-        let mut selected_chat_entry = Some(1);
-        let mut compose_target = ComposeTarget::InsertAfterSelection;
-        let mut mode = Mode::Normal;
-        let mut draft = String::from("old");
-
-        open_compose_after_selection(
-            &transcript,
-            &mut selected_chat_entry,
-            &mut compose_target,
-            &mut mode,
-            &mut draft,
-        );
-
-        assert_eq!(compose_target, ComposeTarget::AppendBottom);
-        assert_eq!(selected_chat_entry, None);
-        assert_eq!(mode, Mode::Insert);
-        assert!(draft.is_empty());
-    }
-
-    #[test]
-    fn open_inline_compose_for_selection_prefills_the_selected_message() {
-        let transcript = vec![
-            TranscriptEntry::User("first".to_string()),
-            TranscriptEntry::Assistant {
-                model_id: "m".to_string(),
-                content: "second".to_string(),
-                callouts: vec![],
-                status: None,
-            },
-        ];
-        let mut selected_chat_entry = Some(1);
-        let mut compose_target = ComposeTarget::AppendBottom;
-        let mut mode = Mode::Normal;
-        let mut draft = String::from("old");
-
-        open_inline_compose_for_selection(
-            &transcript,
-            &mut selected_chat_entry,
-            &mut compose_target,
-            &mut mode,
-            &mut draft,
-        );
-
-        assert_eq!(selected_chat_entry, Some(1));
-        assert_eq!(compose_target, ComposeTarget::InsertAfterSelection);
-        assert_eq!(mode, Mode::Insert);
-        assert_eq!(draft, "second");
-    }
-
-    #[test]
-    fn open_footer_compose_clears_selection_and_opens_append_bottom_prompt() {
-        let mut selected_chat_entry = Some(3);
-        let mut compose_target = ComposeTarget::InsertAfterSelection;
-        let mut mode = Mode::Normal;
-        let mut draft = String::from("old");
-
-        open_footer_compose(
-            &mut mode,
-            &mut selected_chat_entry,
-            &mut compose_target,
-            &mut draft,
-        );
-
-        assert_eq!(selected_chat_entry, None);
-        assert_eq!(compose_target, ComposeTarget::AppendBottom);
-        assert_eq!(mode, Mode::Insert);
-        assert!(draft.is_empty());
-    }
-
-    #[test]
-    fn exiting_inline_insert_mode_keeps_the_same_history_selection() {
-        let transcript = vec![
-            TranscriptEntry::User("first".to_string()),
-            TranscriptEntry::Assistant {
-                model_id: "m".to_string(),
-                content: "second".to_string(),
-                callouts: vec![],
-                status: None,
-            },
-        ];
-        let mut selected_chat_entry = Some(1);
-        let mut mode = Mode::Insert;
-
-        exit_insert_mode(
-            &mut mode,
-            &mut selected_chat_entry,
-            ComposeTarget::InsertAfterSelection,
-            &transcript,
-        );
-
-        assert_eq!(mode, Mode::Normal);
-        assert_eq!(selected_chat_entry, Some(1));
-    }
-
-    #[test]
-    fn exiting_footer_insert_mode_selects_the_last_history_entry() {
-        let transcript = vec![
-            TranscriptEntry::User("first".to_string()),
-            TranscriptEntry::Assistant {
-                model_id: "m".to_string(),
-                content: "second".to_string(),
-                callouts: vec![],
-                status: None,
-            },
-        ];
-        let mut selected_chat_entry = None;
-        let mut mode = Mode::Insert;
-
-        exit_insert_mode(
-            &mut mode,
-            &mut selected_chat_entry,
-            ComposeTarget::AppendBottom,
-            &transcript,
-        );
-
-        assert_eq!(mode, Mode::Normal);
-        assert_eq!(selected_chat_entry, Some(1));
-    }
+    use super::*;
 
     #[test]
     fn parse_startup_args_accepts_tools_enable_and_disable() {
@@ -1724,18 +2122,448 @@ mod tests {
     }
 
     #[test]
-    fn replace_selected_chat_entry_does_not_overwrite_system_messages() {
-        let mut transcript = vec![TranscriptEntry::System {
-            content: "system".to_string(),
-            status: None,
-        }];
+    fn tab_labels_number_duplicate_auto_named_models() {
+        let thread = |tab_id, model: &str| ThreadState {
+            tab_id,
+            base_config: ThreadConfig {
+                model_id: model.to_string(),
+                tools_enabled: true,
+            },
+            current_config: ThreadConfig {
+                model_id: model.to_string(),
+                tools_enabled: true,
+            },
+            name_override: None,
+            history: Vec::new(),
+            selected_chat_entry: None,
+            compose_target: ComposeTarget::AppendBottom,
+            draft: String::new(),
+            scroll_anchor: ScrollAnchor::Bottom,
+            queue: VecDeque::new(),
+            running_job: false,
+            loaded_models: HashSet::new(),
+            connections: HashMap::new(),
+        };
 
-        replace_selected_chat_entry(&mut transcript, Some(0), "replacement".to_string());
-
-        assert_eq!(transcript.len(), 2);
-        assert!(matches!(transcript[0], TranscriptEntry::System { .. }));
-        assert!(
-            matches!(transcript[1], TranscriptEntry::User(ref value) if value == "replacement")
+        assert_eq!(
+            tab_labels(&[thread(1, "smollm2"), thread(2, "smollm2")]),
+            vec![String::from("smollm2-1"), String::from("smollm2-2")]
         );
+    }
+
+    #[test]
+    fn effective_config_respects_latest_commands_before_target() {
+        let thread = ThreadState {
+            tab_id: 1,
+            base_config: ThreadConfig {
+                model_id: String::from("smollm2"),
+                tools_enabled: true,
+            },
+            current_config: ThreadConfig {
+                model_id: String::from("smollm2"),
+                tools_enabled: true,
+            },
+            name_override: None,
+            history: vec![
+                HistoryItem {
+                    id: 1,
+                    entry: HistoryEntry::Command {
+                        raw: String::from("tools disable"),
+                        result: String::new(),
+                    },
+                    meta: HistoryMeta::Command(CommandKind::Tools(false)),
+                },
+                HistoryItem {
+                    id: 2,
+                    entry: HistoryEntry::Command {
+                        raw: String::from("model qwen3.5"),
+                        result: String::new(),
+                    },
+                    meta: HistoryMeta::Command(CommandKind::Model(String::from("qwen3.5"))),
+                },
+                HistoryItem {
+                    id: 3,
+                    entry: HistoryEntry::Assistant {
+                        model_id: String::from("qwen3.5"),
+                        prompt: String::from("hello"),
+                        content: String::from("reply"),
+                        callouts: vec![],
+                        status: None,
+                    },
+                    meta: HistoryMeta::None,
+                },
+            ],
+            selected_chat_entry: None,
+            compose_target: ComposeTarget::AppendBottom,
+            draft: String::new(),
+            scroll_anchor: ScrollAnchor::Bottom,
+            queue: VecDeque::new(),
+            running_job: false,
+            loaded_models: HashSet::new(),
+            connections: HashMap::new(),
+        };
+
+        let config = effective_config_until(&thread, 2);
+        assert_eq!(config.model_id, "qwen3.5");
+        assert!(!config.tools_enabled);
+    }
+
+    #[test]
+    fn selection_edit_action_allows_prompt_edits_for_assistant_messages() {
+        assert!(matches!(
+            selection_edit_action(&HistoryEntry::Assistant {
+                model_id: String::from("m"),
+                prompt: String::from("question"),
+                content: String::from("answer"),
+                callouts: vec![],
+                status: None,
+            }),
+            Some(SelectionEditAction::Prompt(value)) if value == "question"
+        ));
+        assert!(matches!(
+            selection_edit_action(&HistoryEntry::Command {
+                raw: String::from("tools disable"),
+                result: String::new(),
+            }),
+            Some(SelectionEditAction::Command(value)) if value == "tools disable"
+        ));
+        assert!(matches!(
+            selection_edit_action(&HistoryEntry::LoadingModel {
+                model_id: String::from("m"),
+                status: None,
+            }),
+            None
+        ));
+        assert!(selection_edit_action(&HistoryEntry::SystemNotice(String::from("note"))).is_none());
+    }
+
+    #[test]
+    fn open_inline_compose_inserts_after_selected_message() {
+        let thread = ThreadState {
+            tab_id: 1,
+            base_config: ThreadConfig {
+                model_id: String::from("m"),
+                tools_enabled: true,
+            },
+            current_config: ThreadConfig {
+                model_id: String::from("m"),
+                tools_enabled: true,
+            },
+            name_override: None,
+            history: vec![
+                HistoryItem {
+                    id: 1,
+                    entry: HistoryEntry::Assistant {
+                        model_id: String::from("m"),
+                        prompt: String::from("first"),
+                        content: String::from("one"),
+                        callouts: vec![],
+                        status: None,
+                    },
+                    meta: HistoryMeta::None,
+                },
+                HistoryItem {
+                    id: 2,
+                    entry: HistoryEntry::Assistant {
+                        model_id: String::from("m"),
+                        prompt: String::from("second"),
+                        content: String::from("two"),
+                        callouts: vec![],
+                        status: None,
+                    },
+                    meta: HistoryMeta::None,
+                },
+            ],
+            selected_chat_entry: Some(0),
+            compose_target: ComposeTarget::AppendBottom,
+            draft: String::new(),
+            scroll_anchor: ScrollAnchor::Bottom,
+            queue: VecDeque::new(),
+            running_job: false,
+            loaded_models: HashSet::new(),
+            connections: HashMap::new(),
+        };
+        let mut app = AppState {
+            threads: vec![thread],
+            active_thread_idx: 0,
+            mode: Mode::Normal,
+            command_palette: CommandPaletteState::new(vec![]),
+            next_history_id: 3,
+            next_tab_id: 2,
+            command_edit_target: None,
+            inline_command_placeholder: None,
+            delete_target_id: None,
+        };
+
+        open_inline_compose_relative(&mut app, InlineComposePosition::After);
+
+        let thread = &app.threads[0];
+        assert_eq!(thread.history.len(), 3);
+        assert!(matches!(
+            thread.history[1].entry,
+            HistoryEntry::Assistant { ref prompt, status: None, .. } if prompt.is_empty()
+        ));
+        assert_eq!(thread.selected_chat_entry, Some(1));
+        assert_eq!(thread.compose_target, ComposeTarget::EditEntry(3));
+        assert!(matches!(app.mode, Mode::Insert));
+    }
+
+    #[test]
+    fn open_inline_compose_after_last_message_falls_back_to_footer() {
+        let thread = ThreadState {
+            tab_id: 1,
+            base_config: ThreadConfig {
+                model_id: String::from("m"),
+                tools_enabled: true,
+            },
+            current_config: ThreadConfig {
+                model_id: String::from("m"),
+                tools_enabled: true,
+            },
+            name_override: None,
+            history: vec![HistoryItem {
+                id: 1,
+                entry: HistoryEntry::Assistant {
+                    model_id: String::from("m"),
+                    prompt: String::from("last"),
+                    content: String::from("done"),
+                    callouts: vec![],
+                    status: None,
+                },
+                meta: HistoryMeta::None,
+            }],
+            selected_chat_entry: Some(0),
+            compose_target: ComposeTarget::AppendBottom,
+            draft: String::new(),
+            scroll_anchor: ScrollAnchor::Bottom,
+            queue: VecDeque::new(),
+            running_job: false,
+            loaded_models: HashSet::new(),
+            connections: HashMap::new(),
+        };
+        let mut app = AppState {
+            threads: vec![thread],
+            active_thread_idx: 0,
+            mode: Mode::Normal,
+            command_palette: CommandPaletteState::new(vec![]),
+            next_history_id: 2,
+            next_tab_id: 2,
+            command_edit_target: None,
+            inline_command_placeholder: None,
+            delete_target_id: None,
+        };
+
+        open_inline_compose_relative(&mut app, InlineComposePosition::After);
+
+        let thread = &app.threads[0];
+        assert_eq!(thread.history.len(), 1);
+        assert!(matches!(thread.compose_target, ComposeTarget::AppendBottom));
+        assert!(thread.selected_chat_entry.is_none());
+        assert!(matches!(app.mode, Mode::Insert));
+    }
+
+    #[test]
+    fn open_inline_command_inserts_before_or_after_selected_message() {
+        let base_thread = |selected_chat_entry| ThreadState {
+            tab_id: 1,
+            base_config: ThreadConfig {
+                model_id: String::from("m"),
+                tools_enabled: true,
+            },
+            current_config: ThreadConfig {
+                model_id: String::from("m"),
+                tools_enabled: true,
+            },
+            name_override: None,
+            history: vec![
+                HistoryItem {
+                    id: 1,
+                    entry: HistoryEntry::Assistant {
+                        model_id: String::from("m"),
+                        prompt: String::from("first"),
+                        content: String::from("one"),
+                        callouts: vec![],
+                        status: None,
+                    },
+                    meta: HistoryMeta::None,
+                },
+                HistoryItem {
+                    id: 2,
+                    entry: HistoryEntry::Assistant {
+                        model_id: String::from("m"),
+                        prompt: String::from("second"),
+                        content: String::from("two"),
+                        callouts: vec![],
+                        status: None,
+                    },
+                    meta: HistoryMeta::None,
+                },
+            ],
+            selected_chat_entry,
+            compose_target: ComposeTarget::AppendBottom,
+            draft: String::new(),
+            scroll_anchor: ScrollAnchor::Bottom,
+            queue: VecDeque::new(),
+            running_job: false,
+            loaded_models: HashSet::new(),
+            connections: HashMap::new(),
+        };
+
+        let mut app = AppState {
+            threads: vec![base_thread(Some(0))],
+            active_thread_idx: 0,
+            mode: Mode::Normal,
+            command_palette: CommandPaletteState::new(vec![]),
+            next_history_id: 3,
+            next_tab_id: 2,
+            command_edit_target: None,
+            inline_command_placeholder: None,
+            delete_target_id: None,
+        };
+
+        open_inline_command_relative(&mut app, InlineCommandPosition::After);
+        let thread = &app.threads[0];
+        assert_eq!(thread.history.len(), 3);
+        assert!(matches!(
+            thread.history[1].entry,
+            HistoryEntry::Command { ref raw, ref result } if raw.is_empty() && result.is_empty()
+        ));
+        assert_eq!(thread.selected_chat_entry, Some(1));
+        assert_eq!(app.command_edit_target, Some(3));
+        assert!(matches!(app.mode, Mode::Command));
+
+        let mut app = AppState {
+            threads: vec![base_thread(Some(1))],
+            active_thread_idx: 0,
+            mode: Mode::Normal,
+            command_palette: CommandPaletteState::new(vec![]),
+            next_history_id: 3,
+            next_tab_id: 2,
+            command_edit_target: None,
+            inline_command_placeholder: None,
+            delete_target_id: None,
+        };
+
+        open_inline_command_relative(&mut app, InlineCommandPosition::Before);
+        let thread = &app.threads[0];
+        assert_eq!(thread.history.len(), 3);
+        assert!(matches!(
+            thread.history[1].entry,
+            HistoryEntry::Command { ref raw, ref result } if raw.is_empty() && result.is_empty()
+        ));
+        assert_eq!(thread.selected_chat_entry, Some(1));
+        assert_eq!(app.command_edit_target, Some(3));
+        assert!(matches!(app.mode, Mode::Command));
+    }
+
+    #[test]
+    fn canceling_inline_command_removes_placeholder_entry() {
+        let thread = ThreadState {
+            tab_id: 1,
+            base_config: ThreadConfig {
+                model_id: String::from("m"),
+                tools_enabled: true,
+            },
+            current_config: ThreadConfig {
+                model_id: String::from("m"),
+                tools_enabled: true,
+            },
+            name_override: None,
+            history: vec![
+                HistoryItem {
+                    id: 1,
+                    entry: HistoryEntry::Assistant {
+                        model_id: String::from("m"),
+                        prompt: String::from("first"),
+                        content: String::from("one"),
+                        callouts: vec![],
+                        status: None,
+                    },
+                    meta: HistoryMeta::None,
+                },
+                HistoryItem {
+                    id: 2,
+                    entry: HistoryEntry::Assistant {
+                        model_id: String::from("m"),
+                        prompt: String::from("second"),
+                        content: String::from("two"),
+                        callouts: vec![],
+                        status: None,
+                    },
+                    meta: HistoryMeta::None,
+                },
+            ],
+            selected_chat_entry: Some(0),
+            compose_target: ComposeTarget::AppendBottom,
+            draft: String::new(),
+            scroll_anchor: ScrollAnchor::Bottom,
+            queue: VecDeque::new(),
+            running_job: false,
+            loaded_models: HashSet::new(),
+            connections: HashMap::new(),
+        };
+        let mut app = AppState {
+            threads: vec![thread],
+            active_thread_idx: 0,
+            mode: Mode::Normal,
+            command_palette: CommandPaletteState::new(vec![]),
+            next_history_id: 3,
+            next_tab_id: 2,
+            command_edit_target: None,
+            inline_command_placeholder: None,
+            delete_target_id: None,
+        };
+
+        open_inline_command_relative(&mut app, InlineCommandPosition::After);
+        cancel_inline_command_insert(&mut app);
+
+        let thread = &app.threads[0];
+        assert_eq!(thread.history.len(), 2);
+        assert_eq!(thread.selected_chat_entry, Some(0));
+        assert!(app.inline_command_placeholder.is_none());
+    }
+
+    #[test]
+    fn normalize_selection_completes_loaded_model_spinners() {
+        let mut thread = ThreadState {
+            tab_id: 1,
+            base_config: ThreadConfig {
+                model_id: String::from("m"),
+                tools_enabled: true,
+            },
+            current_config: ThreadConfig {
+                model_id: String::from("m"),
+                tools_enabled: true,
+            },
+            name_override: None,
+            history: vec![HistoryItem {
+                id: 1,
+                entry: HistoryEntry::LoadingModel {
+                    model_id: String::from("m"),
+                    status: Some(ModelLoadStatus::Loading {
+                        started_at: Instant::now(),
+                    }),
+                },
+                meta: HistoryMeta::None,
+            }],
+            selected_chat_entry: None,
+            compose_target: ComposeTarget::AppendBottom,
+            draft: String::new(),
+            scroll_anchor: ScrollAnchor::Bottom,
+            queue: VecDeque::new(),
+            running_job: false,
+            loaded_models: HashSet::from([String::from("m")]),
+            connections: HashMap::new(),
+        };
+
+        normalize_selection(&mut thread);
+
+        assert!(matches!(
+            thread.history[0].entry,
+            HistoryEntry::LoadingModel {
+                status: Some(ModelLoadStatus::Loaded),
+                ..
+            }
+        ));
     }
 }

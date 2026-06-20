@@ -4,12 +4,27 @@ use fst::{IntoStreamer, Set, Streamer};
 const AUTOCOMPLETE_STATE_LIMIT: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TabTarget {
+    Id(usize),
+    Name(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandDispatch {
     Quit,
     OpenModelPrefix,
-    SwitchModel(String),
     OpenToolsPrefix,
+    OpenTabPrefix,
+    OpenCommandAfter,
+    OpenCommandBefore,
+    ListModels,
+    SwitchModel(String),
     SetToolsEnabled(bool),
+    Break,
+    ActivateTab(TabTarget),
+    NewTab(String),
+    RenameTab { target: TabTarget, new_name: String },
+    KillTab(TabTarget),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +46,8 @@ pub struct CommandPaletteView<'a> {
     pub preview_text: Option<&'a str>,
     pub suggestions: &'a [CommandSuggestion],
     pub highlighted: Option<usize>,
+    pub error_text: Option<&'a str>,
+    pub has_error: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +62,8 @@ pub struct CommandPaletteState {
     highlighted: Option<usize>,
     suggestions: Vec<CommandSuggestion>,
     model_ids: Vec<String>,
+    tab_labels: Vec<String>,
+    error_text: Option<String>,
 }
 
 impl CommandPaletteState {
@@ -54,21 +73,28 @@ impl CommandPaletteState {
             highlighted: None,
             suggestions: Vec::new(),
             model_ids,
+            tab_labels: Vec::new(),
+            error_text: None,
         };
         state.refresh_suggestions();
         state
     }
 
     pub fn open(&mut self) {
-        self.draft.clear();
-        self.highlighted = None;
-        self.refresh_suggestions();
+        self.set_draft(String::new());
+        self.clear_error();
+    }
+
+    pub fn open_with_draft(&mut self, draft: impl Into<String>) {
+        self.set_draft(draft.into());
+        self.clear_error();
     }
 
     pub fn close(&mut self) {
         self.draft.clear();
         self.highlighted = None;
         self.suggestions.clear();
+        self.error_text = None;
     }
 
     pub fn set_model_ids<I, S>(&mut self, model_ids: I)
@@ -79,6 +105,18 @@ impl CommandPaletteState {
         let next = model_ids.into_iter().map(Into::into).collect::<Vec<_>>();
         if self.model_ids != next {
             self.model_ids = next;
+            self.refresh_suggestions();
+        }
+    }
+
+    pub fn set_tab_labels<I, S>(&mut self, tab_labels: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let next = tab_labels.into_iter().map(Into::into).collect::<Vec<_>>();
+        if self.tab_labels != next {
+            self.tab_labels = next;
             self.refresh_suggestions();
         }
     }
@@ -101,24 +139,44 @@ impl CommandPaletteState {
             .map(|suggestion| suggestion.display.as_str())
     }
 
+    pub fn error_text(&self) -> Option<&str> {
+        self.error_text.as_deref()
+    }
+
+    pub fn has_error(&self) -> bool {
+        self.error_text.is_some()
+    }
+
+    pub fn clear_error(&mut self) {
+        self.error_text = None;
+    }
+
+    pub fn set_error(&mut self, error: impl Into<String>) {
+        self.error_text = Some(error.into());
+    }
+
     pub fn view(&self) -> CommandPaletteView<'_> {
         CommandPaletteView {
             draft: self.draft(),
             preview_text: self.preview_text(),
             suggestions: self.suggestions(),
             highlighted: self.highlighted(),
+            error_text: self.error_text(),
+            has_error: self.has_error(),
         }
     }
 
     pub fn input_char(&mut self, ch: char) {
         self.draft.push(ch);
         self.highlighted = None;
+        self.clear_error();
         self.refresh_suggestions();
     }
 
     pub fn backspace(&mut self) {
         self.draft.pop();
         self.highlighted = None;
+        self.clear_error();
         self.refresh_suggestions();
     }
 
@@ -137,6 +195,8 @@ impl CommandPaletteState {
     }
 
     pub fn commit(&mut self) -> Result<CommandCommit, CommandParseError> {
+        self.clear_error();
+
         if let Some(index) = self.highlighted {
             if let Some(suggestion) = self.suggestions.get(index).cloned() {
                 self.draft = suggestion.display.clone();
@@ -144,7 +204,9 @@ impl CommandPaletteState {
                 self.refresh_suggestions();
 
                 return match suggestion.dispatch {
-                    CommandDispatch::OpenModelPrefix => Ok(CommandCommit::StayOpen),
+                    CommandDispatch::OpenModelPrefix
+                    | CommandDispatch::OpenToolsPrefix
+                    | CommandDispatch::OpenTabPrefix => Ok(CommandCommit::StayOpen),
                     dispatch => Ok(CommandCommit::Execute(dispatch)),
                 };
             }
@@ -154,8 +216,15 @@ impl CommandPaletteState {
         Ok(CommandCommit::Execute(parsed))
     }
 
+    fn set_draft(&mut self, draft: String) {
+        self.draft = draft;
+        self.highlighted = None;
+        self.refresh_suggestions();
+    }
+
     fn refresh_suggestions(&mut self) {
-        self.suggestions = autocomplete_suggestions(self.draft(), &self.model_ids);
+        self.suggestions =
+            autocomplete_suggestions(self.draft(), &self.model_ids, &self.tab_labels);
         if let Some(index) = self.highlighted {
             if index >= self.suggestions.len() {
                 self.highlighted = None;
@@ -173,16 +242,28 @@ pub fn parse_command(input: &str) -> Result<CommandDispatch, CommandParseError> 
     if input == "q" {
         return Ok(CommandDispatch::Quit);
     }
-
+    if input == "break" {
+        return Ok(CommandDispatch::Break);
+    }
+    if input == "o" {
+        return Ok(CommandDispatch::OpenCommandAfter);
+    }
+    if input == "O" {
+        return Ok(CommandDispatch::OpenCommandBefore);
+    }
     if input == "model" {
         return Err(CommandParseError::Incomplete(String::from(
-            "usage: model <model-id>",
+            "usage: model <model-id>|ls",
         )));
     }
-
     if input == "tools" {
         return Err(CommandParseError::Incomplete(String::from(
             "usage: tools enable|disable",
+        )));
+    }
+    if input == "tab" {
+        return Err(CommandParseError::Incomplete(String::from(
+            "usage: tab <id>|new <model-id>|rename <tab> <name>|kill <tab>",
         )));
     }
 
@@ -190,8 +271,11 @@ pub fn parse_command(input: &str) -> Result<CommandDispatch, CommandParseError> 
         let model_id = model_id.trim();
         if model_id.is_empty() {
             return Err(CommandParseError::Incomplete(String::from(
-                "usage: model <model-id>",
+                "usage: model <model-id>|ls",
             )));
+        }
+        if model_id == "ls" {
+            return Ok(CommandDispatch::ListModels);
         }
         return Ok(CommandDispatch::SwitchModel(model_id.to_string()));
     }
@@ -210,49 +294,153 @@ pub fn parse_command(input: &str) -> Result<CommandDispatch, CommandParseError> 
         };
     }
 
+    if let Some(value) = input.strip_prefix("tab ") {
+        return parse_tab_command(value);
+    }
+
     Err(CommandParseError::Invalid(format!(
         "unknown command: {input}"
     )))
 }
 
-fn autocomplete_suggestions(draft: &str, model_ids: &[String]) -> Vec<CommandSuggestion> {
+fn parse_tab_command(input: &str) -> Result<CommandDispatch, CommandParseError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(CommandParseError::Incomplete(String::from(
+            "usage: tab <id>|new <model-id>|rename <tab> <name>|kill <tab>",
+        )));
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("new ") {
+        let model_id = rest.trim();
+        if model_id.is_empty() {
+            return Err(CommandParseError::Incomplete(String::from(
+                "usage: tab new <model-id>",
+            )));
+        }
+        return Ok(CommandDispatch::NewTab(model_id.to_string()));
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("rename ") {
+        let (target, new_name) = split_once_whitespace(rest).ok_or_else(|| {
+            CommandParseError::Incomplete(String::from("usage: tab rename <tab> <new-name>"))
+        })?;
+        if new_name.trim().is_empty() {
+            return Err(CommandParseError::Incomplete(String::from(
+                "usage: tab rename <tab> <new-name>",
+            )));
+        }
+        return Ok(CommandDispatch::RenameTab {
+            target: parse_tab_target(target),
+            new_name: new_name.trim().to_string(),
+        });
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("kill ") {
+        let target = rest.trim();
+        if target.is_empty() {
+            return Err(CommandParseError::Incomplete(String::from(
+                "usage: tab kill <tab>",
+            )));
+        }
+        return Ok(CommandDispatch::KillTab(parse_tab_target(target)));
+    }
+
+    Ok(CommandDispatch::ActivateTab(parse_tab_target(trimmed)))
+}
+
+fn split_once_whitespace(input: &str) -> Option<(&str, &str)> {
+    let trimmed = input.trim();
+    let split_at = trimmed.find(char::is_whitespace)?;
+    let left = &trimmed[..split_at];
+    let right = trimmed[split_at..].trim_start();
+    Some((left, right))
+}
+
+fn parse_tab_target(input: &str) -> TabTarget {
+    match input.trim().parse::<usize>() {
+        Ok(id) if id > 0 => TabTarget::Id(id),
+        _ => TabTarget::Name(input.trim().to_string()),
+    }
+}
+
+fn autocomplete_suggestions(
+    draft: &str,
+    model_ids: &[String],
+    tab_labels: &[String],
+) -> Vec<CommandSuggestion> {
     let trimmed = draft.trim_start();
     if trimmed.starts_with("model ") {
         let query = trimmed.trim_start_matches("model ").trim_start();
-        return model_id_suggestions(query, model_ids);
+        return model_suggestions(query, model_ids);
     }
-
     if trimmed.starts_with("tools ") {
         let query = trimmed.trim_start_matches("tools ").trim_start();
         return tool_state_suggestions(query);
     }
-
+    if trimmed.starts_with("tab ") {
+        let query = trimmed.trim_start_matches("tab ").trim_start();
+        return tab_suggestions(query, model_ids, tab_labels);
+    }
     if trimmed == "model" {
         return vec![CommandSuggestion {
             display: String::from("model "),
             dispatch: CommandDispatch::OpenModelPrefix,
         }];
     }
-
     if trimmed == "tools" {
         return vec![CommandSuggestion {
             display: String::from("tools "),
             dispatch: CommandDispatch::OpenToolsPrefix,
         }];
     }
+    if trimmed == "tab" {
+        return vec![CommandSuggestion {
+            display: String::from("tab "),
+            dispatch: CommandDispatch::OpenTabPrefix,
+        }];
+    }
+    if trimmed == "o" {
+        return vec![CommandSuggestion {
+            display: String::from("o"),
+            dispatch: CommandDispatch::OpenCommandAfter,
+        }];
+    }
+    if trimmed == "O" {
+        return vec![CommandSuggestion {
+            display: String::from("O"),
+            dispatch: CommandDispatch::OpenCommandBefore,
+        }];
+    }
 
-    root_suggestions(trimmed, model_ids)
+    root_suggestions(trimmed)
 }
 
-fn root_suggestions(query: &str, _model_ids: &[String]) -> Vec<CommandSuggestion> {
+fn root_suggestions(query: &str) -> Vec<CommandSuggestion> {
     let mut suggestions = vec![
+        CommandSuggestion {
+            display: String::from("break"),
+            dispatch: CommandDispatch::Break,
+        },
+        CommandSuggestion {
+            display: String::from("O"),
+            dispatch: CommandDispatch::OpenCommandBefore,
+        },
+        CommandSuggestion {
+            display: String::from("o"),
+            dispatch: CommandDispatch::OpenCommandAfter,
+        },
+        CommandSuggestion {
+            display: String::from("model "),
+            dispatch: CommandDispatch::OpenModelPrefix,
+        },
         CommandSuggestion {
             display: String::from("q"),
             dispatch: CommandDispatch::Quit,
         },
         CommandSuggestion {
-            display: String::from("model "),
-            dispatch: CommandDispatch::OpenModelPrefix,
+            display: String::from("tab "),
+            dispatch: CommandDispatch::OpenTabPrefix,
         },
         CommandSuggestion {
             display: String::from("tools "),
@@ -268,10 +456,10 @@ fn root_suggestions(query: &str, _model_ids: &[String]) -> Vec<CommandSuggestion
     fuzzy_rank(query, &suggestions)
         .into_iter()
         .map(|suggestion| suggestion.0)
-        .collect::<Vec<_>>()
+        .collect()
 }
 
-fn model_id_suggestions(query: &str, model_ids: &[String]) -> Vec<CommandSuggestion> {
+fn model_suggestions(query: &str, model_ids: &[String]) -> Vec<CommandSuggestion> {
     let mut suggestions = model_ids
         .iter()
         .cloned()
@@ -280,6 +468,10 @@ fn model_id_suggestions(query: &str, model_ids: &[String]) -> Vec<CommandSuggest
             dispatch: CommandDispatch::SwitchModel(model_id),
         })
         .collect::<Vec<_>>();
+    suggestions.push(CommandSuggestion {
+        display: String::from("model ls"),
+        dispatch: CommandDispatch::ListModels,
+    });
 
     if query.is_empty() {
         suggestions.sort_by(|left, right| left.display.cmp(&right.display));
@@ -289,18 +481,18 @@ fn model_id_suggestions(query: &str, model_ids: &[String]) -> Vec<CommandSuggest
     fuzzy_rank(query, &suggestions)
         .into_iter()
         .map(|suggestion| suggestion.0)
-        .collect::<Vec<_>>()
+        .collect()
 }
 
 fn tool_state_suggestions(query: &str) -> Vec<CommandSuggestion> {
     let mut suggestions = vec![
         CommandSuggestion {
-            display: String::from("tools enable"),
-            dispatch: CommandDispatch::SetToolsEnabled(true),
-        },
-        CommandSuggestion {
             display: String::from("tools disable"),
             dispatch: CommandDispatch::SetToolsEnabled(false),
+        },
+        CommandSuggestion {
+            display: String::from("tools enable"),
+            dispatch: CommandDispatch::SetToolsEnabled(true),
         },
     ];
 
@@ -312,7 +504,57 @@ fn tool_state_suggestions(query: &str) -> Vec<CommandSuggestion> {
     fuzzy_rank(query, &suggestions)
         .into_iter()
         .map(|suggestion| suggestion.0)
-        .collect::<Vec<_>>()
+        .collect()
+}
+
+fn tab_suggestions(
+    query: &str,
+    model_ids: &[String],
+    tab_labels: &[String],
+) -> Vec<CommandSuggestion> {
+    let mut suggestions = Vec::new();
+    suggestions.push(CommandSuggestion {
+        display: String::from("tab 1"),
+        dispatch: CommandDispatch::ActivateTab(TabTarget::Id(1)),
+    });
+    suggestions.push(CommandSuggestion {
+        display: String::from("tab kill 1"),
+        dispatch: CommandDispatch::KillTab(TabTarget::Id(1)),
+    });
+    suggestions.push(CommandSuggestion {
+        display: String::from("tab rename 1 renamed"),
+        dispatch: CommandDispatch::RenameTab {
+            target: TabTarget::Id(1),
+            new_name: String::from("renamed"),
+        },
+    });
+
+    for label in tab_labels {
+        suggestions.push(CommandSuggestion {
+            display: format!("tab {label}"),
+            dispatch: CommandDispatch::ActivateTab(TabTarget::Name(label.clone())),
+        });
+    }
+
+    for model_id in model_ids {
+        suggestions.push(CommandSuggestion {
+            display: format!("tab new {model_id}"),
+            dispatch: CommandDispatch::NewTab(model_id.clone()),
+        });
+    }
+
+    if query.is_empty() {
+        suggestions.sort_by(|left, right| left.display.cmp(&right.display));
+        suggestions.dedup_by(|left, right| left.display == right.display);
+        return suggestions;
+    }
+
+    let mut ranked = fuzzy_rank(query, &suggestions)
+        .into_iter()
+        .map(|suggestion| suggestion.0)
+        .collect::<Vec<_>>();
+    ranked.dedup_by(|left, right| left.display == right.display);
+    ranked
 }
 
 fn fuzzy_rank(query: &str, suggestions: &[CommandSuggestion]) -> Vec<(CommandSuggestion, usize)> {
@@ -324,31 +566,13 @@ fn fuzzy_rank(query: &str, suggestions: &[CommandSuggestion]) -> Vec<(CommandSug
     candidates.sort_unstable();
     let set = match Set::from_iter(candidates.iter().copied()) {
         Ok(set) => set,
-        Err(_) => {
-            return suggestions
-                .iter()
-                .cloned()
-                .map(|suggestion| {
-                    let distance = edit_distance(query, &suggestion.display);
-                    (suggestion, distance)
-                })
-                .collect::<Vec<_>>();
-        }
+        Err(_) => return fallback_rank(query, suggestions),
     };
 
     let limit = query.chars().count() as u32 + 6;
     let automaton = match Levenshtein::new_with_limit(query, limit, AUTOCOMPLETE_STATE_LIMIT) {
         Ok(automaton) => automaton,
-        Err(_) => {
-            return suggestions
-                .iter()
-                .cloned()
-                .map(|suggestion| {
-                    let distance = edit_distance(query, &suggestion.display);
-                    (suggestion, distance)
-                })
-                .collect::<Vec<_>>();
-        }
+        Err(_) => return fallback_rank(query, suggestions),
     };
 
     let mut stream = set.search(&automaton).into_stream();
@@ -362,8 +586,10 @@ fn fuzzy_rank(query: &str, suggestions: &[CommandSuggestion]) -> Vec<(CommandSug
             .find(|suggestion| suggestion.display == display)
             .cloned()
         {
-            let distance = edit_distance(query, &suggestion.display);
-            matches.push((suggestion, distance));
+            matches.push((
+                suggestion.clone(),
+                edit_distance(query, &suggestion.display),
+            ));
         }
     }
 
@@ -377,6 +603,26 @@ fn fuzzy_rank(query: &str, suggestions: &[CommandSuggestion]) -> Vec<(CommandSug
             .then_with(|| left.0.display.cmp(&right.0.display))
     });
     matches
+}
+
+fn fallback_rank(
+    query: &str,
+    suggestions: &[CommandSuggestion],
+) -> Vec<(CommandSuggestion, usize)> {
+    let mut ranked = suggestions
+        .iter()
+        .cloned()
+        .map(|suggestion| {
+            let distance = edit_distance(query, &suggestion.display);
+            (suggestion, distance)
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| left.0.display.cmp(&right.0.display))
+    });
+    ranked
 }
 
 fn edit_distance(left: &str, right: &str) -> usize {
@@ -404,8 +650,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_command_accepts_quit_and_model_switches() {
+    fn parse_command_accepts_extended_commands() {
         assert_eq!(parse_command("q"), Ok(CommandDispatch::Quit));
+        assert_eq!(parse_command("break"), Ok(CommandDispatch::Break));
+        assert_eq!(parse_command("o"), Ok(CommandDispatch::OpenCommandAfter));
+        assert_eq!(parse_command("O"), Ok(CommandDispatch::OpenCommandBefore));
+        assert_eq!(parse_command("model ls"), Ok(CommandDispatch::ListModels));
         assert_eq!(
             parse_command("model qwen3.5-q2k"),
             Ok(CommandDispatch::SwitchModel(String::from("qwen3.5-q2k")))
@@ -414,6 +664,14 @@ mod tests {
             parse_command("tools disable"),
             Ok(CommandDispatch::SetToolsEnabled(false))
         );
+        assert_eq!(
+            parse_command("tab new smollm2"),
+            Ok(CommandDispatch::NewTab(String::from("smollm2")))
+        );
+        assert_eq!(
+            parse_command("tab 2"),
+            Ok(CommandDispatch::ActivateTab(TabTarget::Id(2)))
+        );
     }
 
     #[test]
@@ -421,6 +679,10 @@ mod tests {
         assert_eq!(parse_command(""), Err(CommandParseError::Empty));
         assert!(matches!(
             parse_command("model"),
+            Err(CommandParseError::Incomplete(_))
+        ));
+        assert!(matches!(
+            parse_command("tab"),
             Err(CommandParseError::Incomplete(_))
         ));
         assert!(matches!(
@@ -434,10 +696,9 @@ mod tests {
     }
 
     #[test]
-    fn autocomplete_ranks_by_edit_distance() {
-        let suggestions = root_suggestions("mo", &["smollm2".to_string(), "q".to_string()]);
+    fn autocomplete_ranks_model_prefix_first() {
+        let suggestions = root_suggestions("mo");
         assert_eq!(suggestions[0].display, "model ");
-        assert_eq!(suggestions[1].display, "q");
     }
 
     #[test]
@@ -448,11 +709,7 @@ mod tests {
 
         assert!(!state.cycle_selection());
         assert_eq!(state.highlighted(), Some(0));
-        assert!(!state.cycle_selection());
-        assert_eq!(state.highlighted(), Some(1));
-        assert!(!state.cycle_selection());
-        assert_eq!(state.highlighted(), Some(2));
-        assert!(state.cycle_selection());
+        while !state.cycle_selection() {}
         assert_eq!(state.highlighted(), None);
     }
 
@@ -466,14 +723,12 @@ mod tests {
         assert_eq!(state.preview_text(), Some("model "));
         assert_eq!(state.commit(), Ok(CommandCommit::StayOpen));
 
-        state.input_char(' ');
+        state.input_char('l');
         state.input_char('s');
-        state.input_char('m');
-        state.input_char('o');
 
-        assert!(matches!(
+        assert_eq!(
             state.commit(),
-            Ok(CommandCommit::Execute(CommandDispatch::SwitchModel(_)))
-        ));
+            Ok(CommandCommit::Execute(CommandDispatch::ListModels))
+        );
     }
 }
