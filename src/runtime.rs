@@ -5,10 +5,13 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::Instant;
 
 use crate::agent::ToolFormat;
 use crossbeam::channel;
-use mistralrs::{IsqBits, Model as MistralRuntimeModel, ModelBuilder, RequestBuilder, Response};
+use mistralrs::{
+    GgufModelBuilder, IsqBits, Model as MistralRuntimeModel, ModelBuilder, RequestBuilder, Response,
+};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,9 +30,19 @@ impl Quantization {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadMode {
+    AutoIsq,
+    Gguf {
+        quantized_model_id: &'static str,
+        quantized_filenames: &'static [&'static str],
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelSource {
     repo_id: &'static str,
     quantization: Quantization,
+    load_mode: LoadMode,
 }
 
 impl ModelSource {
@@ -37,6 +50,22 @@ impl ModelSource {
         Self {
             repo_id,
             quantization,
+            load_mode: LoadMode::AutoIsq,
+        }
+    }
+
+    pub const fn gguf(
+        repo_id: &'static str,
+        quantized_model_id: &'static str,
+        quantized_filenames: &'static [&'static str],
+    ) -> Self {
+        Self {
+            repo_id,
+            quantization: Quantization::Unquantized,
+            load_mode: LoadMode::Gguf {
+                quantized_model_id,
+                quantized_filenames,
+            },
         }
     }
 
@@ -47,6 +76,10 @@ impl ModelSource {
     pub const fn quantization(self) -> Quantization {
         self.quantization
     }
+
+    pub const fn load_mode(self) -> LoadMode {
+        self.load_mode
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +89,8 @@ pub enum Model {
     SmolLM3(ModelSource),
     Qwen35(ModelSource),
 }
+
+const QWEN3_GGUF_FILENAMES: &[&str] = &["Qwen3-4B-Q2_K.gguf"];
 
 impl Model {
     pub fn repo_id(&self) -> &'static str {
@@ -73,6 +108,15 @@ impl Model {
             | Self::SmolLM2(source)
             | Self::SmolLM3(source)
             | Self::Qwen35(source) => source.quantization(),
+        }
+    }
+
+    pub fn load_mode(&self) -> LoadMode {
+        match self {
+            Self::SmolLM2360MInstruct(source)
+            | Self::SmolLM2(source)
+            | Self::SmolLM3(source)
+            | Self::Qwen35(source) => source.load_mode(),
         }
     }
 
@@ -192,9 +236,10 @@ impl RuntimeRegistry {
             ),
             RuntimeConfig::new(
                 "qwen3.5-q2k",
-                Model::Qwen35(ModelSource::new(
-                    "RedHatAI/Qwen3.5-4B-quantized.w4a16",
-                    Quantization::Unquantized,
+                Model::Qwen35(ModelSource::gguf(
+                    "unsloth/Qwen3-4B-GGUF",
+                    "unsloth/Qwen3-4B-GGUF",
+                    QWEN3_GGUF_FILENAMES,
                 )),
             ),
             RuntimeConfig::new(
@@ -421,6 +466,11 @@ impl RuntimeConnection {
             return Ok(());
         }
 
+        tracing::info!(
+            connection_id = ?self.id,
+            config_id = %self.config_id,
+            "closing runtime connection"
+        );
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(ConnectionRequest::Close { reply: reply_tx })
@@ -457,7 +507,7 @@ impl RuntimeStatus {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
     UnknownConfig(String),
     ModelBuild(String),
@@ -945,6 +995,11 @@ fn router_loop(
                 if let Some(ConnectionLifecycleEvent::Unload(config_id)) =
                     connections.disconnect(connection_id)
                 {
+                    tracing::info!(
+                        connection_id = ?connection_id,
+                        config_id = %config_id,
+                        "unloading runtime model"
+                    );
                     if let Some(worker_tx) = worker_map.get(&config_id) {
                         let _ = worker_tx.send(WorkerRequest::Unload { config_id });
                     }
@@ -1084,7 +1139,7 @@ fn worker_loop(registry: Arc<RuntimeRegistry>, rx: channel::Receiver<WorkerReque
     while let Ok(request) = rx.recv() {
         match request {
             WorkerRequest::Load { config } => {
-                let _ = runtime.block_on(async {
+                let result = runtime.block_on(async {
                     if !cache.contains_key(&config.id) {
                         let model = load_model(&config).await?;
                         cache.insert(config.id.clone(), model);
@@ -1092,9 +1147,25 @@ fn worker_loop(registry: Arc<RuntimeRegistry>, rx: channel::Receiver<WorkerReque
 
                     Ok::<(), RuntimeError>(())
                 });
+
+                if let Err(err) = result {
+                    tracing::error!(
+                        config_id = %config.id,
+                        repo_id = %config.model.repo_id(),
+                        error = %err,
+                        "model preload failed"
+                    );
+                }
             }
             WorkerRequest::Unload { config_id } => {
-                cache.remove(&config_id);
+                if cache.remove(&config_id).is_some() {
+                    tracing::info!(config_id = %config_id, "runtime model unloaded");
+                } else {
+                    tracing::info!(
+                        config_id = %config_id,
+                        "runtime model unload requested but cache was already empty"
+                    );
+                }
             }
             WorkerRequest::Generate {
                 config,
@@ -1142,7 +1213,27 @@ async fn run_generation(
         .get(&config.id)
         .ok_or_else(|| RuntimeError::UnknownConfig(config.id.clone()))?;
 
+    let emit_error = |error: RuntimeError| {
+        if let (Some(response), Some(connection_id), Some(sequence_number)) =
+            (response.as_ref(), connection_id, sequence_number)
+        {
+            let _ = response.send(RuntimeResponseEvent::Error {
+                connection_id,
+                sequence_number,
+                error,
+            });
+        }
+    };
+
     if !cache.contains_key(&config.id) {
+        let load_started = Instant::now();
+        tracing::info!(
+            config_id = %config.id,
+            repo_id = %config.model.repo_id(),
+            load_mode = ?config.model.load_mode(),
+            quantization = ?config.model.quantization(),
+            "runtime model cache miss; starting load"
+        );
         send_status(
             &status,
             RuntimeStatus::Loading {
@@ -1150,8 +1241,33 @@ async fn run_generation(
                 repo_id: config.model.repo_id().to_string(),
             },
         );
-        let model = load_model(config).await?;
+        let model = match load_model(config).await {
+            Ok(model) => model,
+            Err(err) => {
+                tracing::error!(
+                    config_id = %config.id,
+                    repo_id = %config.model.repo_id(),
+                    error = %err,
+                    "model load failed"
+                );
+                emit_error(err.clone());
+                return Err(err);
+            }
+        };
         cache.insert(config.id.clone(), model);
+        tracing::info!(
+            config_id = %config.id,
+            repo_id = %config.model.repo_id(),
+            load_mode = ?config.model.load_mode(),
+            elapsed_ms = load_started.elapsed().as_millis(),
+            "runtime model cached"
+        );
+    } else {
+        tracing::info!(
+            config_id = %config.id,
+            repo_id = %config.model.repo_id(),
+            "runtime model cache hit"
+        );
     }
 
     send_status(
@@ -1166,10 +1282,20 @@ async fn run_generation(
         repo_id = %config.model.repo_id(),
         "generation started"
     );
-    let mut stream = model
-        .stream_chat_request(request)
-        .await
-        .map_err(|err| RuntimeError::Inference(err.to_string()))?;
+    let mut stream = match model.stream_chat_request(request).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            let error = RuntimeError::Inference(err.to_string());
+            tracing::error!(
+                config_id = %config.id,
+                repo_id = %config.model.repo_id(),
+                error = %error,
+                "generation stream failed to start"
+            );
+            emit_error(error.clone());
+            return Err(error);
+        }
+    };
     let mut streamed_content = String::new();
     let mut chunk_count = 0usize;
 
@@ -1192,18 +1318,6 @@ async fn run_generation(
             let _ = response.send(RuntimeResponseEvent::Complete {
                 connection_id,
                 sequence_number,
-            });
-        }
-    };
-
-    let emit_error = |error: RuntimeError| {
-        if let (Some(response), Some(connection_id), Some(sequence_number)) =
-            (response.as_ref(), connection_id, sequence_number)
-        {
-            let _ = response.send(RuntimeResponseEvent::Error {
-                connection_id,
-                sequence_number,
-                error,
             });
         }
     };
@@ -1395,22 +1509,97 @@ fn model_load_lock(repo_id: &'static str) -> Arc<Mutex<()>> {
 
 async fn load_model(config: &RuntimeConfig) -> Result<MistralRuntimeModel, RuntimeError> {
     let repo_id = config.model.repo_id();
+    let load_started = Instant::now();
     tracing::info!(
         config_id = %config.id,
         repo_id = %repo_id,
         backend = runtime_backend(),
+        load_mode = ?config.model.load_mode(),
         quantization = ?config.model.quantization(),
         "loading runtime model"
     );
+    tracing::info!(
+        config_id = %config.id,
+        repo_id = %repo_id,
+        "waiting for model load lock"
+    );
     let lock = model_load_lock(repo_id);
     let _guard = lock.lock().expect("model load lock poisoned");
-    let builder = ModelBuilder::new(repo_id);
-    let builder = config.model.quantization().apply(builder);
+    tracing::info!(
+        config_id = %config.id,
+        repo_id = %repo_id,
+        elapsed_ms = load_started.elapsed().as_millis(),
+        "model load lock acquired"
+    );
+    match config.model.load_mode() {
+        LoadMode::AutoIsq => {
+            tracing::info!(
+                config_id = %config.id,
+                repo_id = %repo_id,
+                "building auto-isq model builder"
+            );
+            let builder = ModelBuilder::new(repo_id);
+            let builder = config.model.quantization().apply(builder);
 
-    builder
-        .build()
-        .await
-        .map_err(|err| RuntimeError::ModelBuild(err.to_string()))
+            tracing::info!(
+                config_id = %config.id,
+                repo_id = %repo_id,
+                "starting model build"
+            );
+            builder
+                .build()
+                .await
+                .map_err(|err| RuntimeError::ModelBuild(err.to_string()))
+                .map(|model| {
+                    tracing::info!(
+                        config_id = %config.id,
+                        repo_id = %repo_id,
+                        elapsed_ms = load_started.elapsed().as_millis(),
+                        "model build completed"
+                    );
+                    model
+                })
+        }
+        LoadMode::Gguf {
+            quantized_model_id,
+            quantized_filenames,
+        } => {
+            tracing::info!(
+                config_id = %config.id,
+                repo_id = %repo_id,
+                quantized_model_id = %quantized_model_id,
+                "building gguf model builder"
+            );
+            let builder = GgufModelBuilder::new(
+                quantized_model_id,
+                quantized_filenames
+                    .iter()
+                    .map(|file| (*file).to_string())
+                    .collect(),
+            );
+
+            tracing::info!(
+                config_id = %config.id,
+                repo_id = %repo_id,
+                quantized_model_id = %quantized_model_id,
+                "starting gguf model build"
+            );
+            builder
+                .build()
+                .await
+                .map_err(|err| RuntimeError::ModelBuild(err.to_string()))
+                .map(|model| {
+                    tracing::info!(
+                        config_id = %config.id,
+                        repo_id = %repo_id,
+                        quantized_model_id = %quantized_model_id,
+                        elapsed_ms = load_started.elapsed().as_millis(),
+                        "gguf model build completed"
+                    );
+                    model
+                })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1492,8 +1681,15 @@ mod tests {
         assert_eq!(smollm3.model.quantization(), Quantization::Unquantized);
 
         let qwen = registry.get("qwen3.5-q2k").expect("qwen3.5-q2k registered");
-        assert_eq!(qwen.model.repo_id(), "RedHatAI/Qwen3.5-4B-quantized.w4a16");
+        assert_eq!(qwen.model.repo_id(), "unsloth/Qwen3-4B-GGUF");
         assert_eq!(qwen.model.quantization(), Quantization::Unquantized);
+        assert!(matches!(
+            qwen.model.load_mode(),
+            LoadMode::Gguf {
+                quantized_model_id: "unsloth/Qwen3-4B-GGUF",
+                ..
+            }
+        ));
 
         let smollm2_360m = registry
             .get("smollm2-360m-isq4")

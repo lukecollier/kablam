@@ -119,7 +119,9 @@ impl ToolFormat {
         match self {
             Self::XmlJson => format!(
                 "{base_prompt}\n\n\
-                You can call tools when useful.\n\
+                Use tools only when the user explicitly asks for project-local search, file reading, or the fake weather tool, or when the request cannot be answered from the conversation alone.\n\
+                Do not use tools for greetings, identity questions, casual conversation, or other general knowledge questions.\n\
+                Only use one of the listed tool names. Never invent a new tool name.\n\
                 Available tools:\n{tools_json}\n\n\
                 For SmolLM3 tool calls, output only this exact XML tag with a JSON object inside:\n\
                 <tool_call>{{\"name\":\"tool_name\",\"arguments\":{{}}}}</tool_call>\n\
@@ -127,7 +129,9 @@ impl ToolFormat {
             ),
             Self::JsonEnvelope => format!(
                 "{base_prompt}\n\n\
-                You can call tools when useful.\n\
+                Use tools only when the user explicitly asks for project-local search, file reading, or the fake weather tool, or when the request cannot be answered from the conversation alone.\n\
+                Do not use tools for greetings, identity questions, casual conversation, or other general knowledge questions.\n\
+                Only use one of the listed tool names. Never invent a new tool name.\n\
                 Available tools:\n{tools_json}\n\n\
                 For Qwen tool calls, output only this JSON object and no prose:\n\
                 {{\"tool_call\":{{\"name\":\"tool_name\",\"arguments\":{{}}}}}}"
