@@ -13,6 +13,7 @@ Alo how possible local agents are for automating simple ticket solves, the core 
 
 - [ ] checkpointing
 - [ ] tool calls `mutate / query`
+- [x] tabs + traversal (with arrow keys)
 - [x] editable chat history
 - [x] editable commands
 - [x] models choices
@@ -20,9 +21,11 @@ Alo how possible local agents are for automating simple ticket solves, the core 
 - [ ] frontier models
 - [x] commands
 - [x] threaded conversations
+- [x] markdown parsing
+- [x] code block syntax highlighting
 - [ ] searching
 - [x] navigation
 - [x] vim keybindings
-- [ ] notifications (e.g * on a threaded name tab when an event has occured)
+- [x] alerts (e.g * on a threaded name tab when an event has occured)
 
 

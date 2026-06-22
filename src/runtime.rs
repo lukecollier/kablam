@@ -12,6 +12,7 @@ use crossbeam::channel;
 use mistralrs::{
     GgufModelBuilder, IsqBits, Model as MistralRuntimeModel, ModelBuilder, RequestBuilder, Response,
 };
+use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +236,13 @@ impl RuntimeRegistry {
                 Model::Qwen35(ModelSource::new("Qwen/Qwen3-4B", Quantization::AutoIsq4)),
             ),
             RuntimeConfig::new(
+                "r1-1.5b",
+                Model::Qwen35(ModelSource::new(
+                    "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+                    Quantization::AutoIsq4,
+                )),
+            ),
+            RuntimeConfig::new(
                 "qwen3.5-q2k",
                 Model::Qwen35(ModelSource::gguf(
                     "unsloth/Qwen3-4B-GGUF",
@@ -277,6 +285,16 @@ pub enum RuntimeRequest {
         response: Option<mpsc::UnboundedSender<RuntimeResponseEvent>>,
         reply: Option<oneshot::Sender<Result<String, RuntimeError>>>,
     },
+    Interrupt {
+        config_id: String,
+        connection_id: ConnectionId,
+        sequence_number: u64,
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    ClearInterrupt {
+        connection_id: ConnectionId,
+        sequence_number: u64,
+    },
     Shutdown,
 }
 
@@ -299,6 +317,10 @@ pub enum ConnectionRequest {
     Close {
         reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
+    Interrupt {
+        sequence_number: u64,
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -309,6 +331,10 @@ pub enum RuntimeResponseEvent {
         content: String,
     },
     Complete {
+        connection_id: ConnectionId,
+        sequence_number: u64,
+    },
+    Interrupted {
         connection_id: ConnectionId,
         sequence_number: u64,
     },
@@ -357,6 +383,7 @@ impl RuntimeResponseStream {
             match event {
                 RuntimeResponseEvent::Chunk { content, .. } => response.push_str(&content),
                 RuntimeResponseEvent::Complete { .. } => return Ok(response),
+                RuntimeResponseEvent::Interrupted { .. } => return Ok(response),
                 RuntimeResponseEvent::Error { error, .. } => return Err(error),
             }
         }
@@ -480,6 +507,33 @@ impl RuntimeConnection {
 
         reply_rx.await.map_err(|_| RuntimeError::ChannelClosed)?
     }
+
+    pub async fn interrupt_latest(&self) -> Result<(), RuntimeError> {
+        let sequence_number = self
+            .next_sequence_number
+            .load(Ordering::Relaxed)
+            .saturating_sub(1);
+        if sequence_number == 0 {
+            return Ok(());
+        }
+        self.interrupt_sequence(sequence_number).await
+    }
+
+    pub async fn interrupt_sequence(&self, sequence_number: u64) -> Result<(), RuntimeError> {
+        if sequence_number == 0 {
+            return Ok(());
+        }
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(ConnectionRequest::Interrupt {
+                sequence_number,
+                reply: reply_tx,
+            })
+            .map_err(|_| RuntimeError::ConnectionClosed)?;
+        self.signal_forwarder().await?;
+        reply_rx.await.map_err(|_| RuntimeError::ChannelClosed)?
+    }
 }
 
 impl Drop for RuntimeConnection {
@@ -574,6 +628,7 @@ pub struct Runtime {
     tx: channel::Sender<RuntimeRequest>,
     next_connection_id: AtomicU64,
     connections: Arc<Mutex<HashMap<ConnectionId, ConnectionEntry>>>,
+    pending_interrupts: Arc<Mutex<HashMap<(ConnectionId, u64), GenerationCancellation>>>,
     forwarder_tx: mpsc::Sender<ForwarderSignal>,
     router: Option<thread::JoinHandle<()>>,
     forwarder: Option<thread::JoinHandle<()>>,
@@ -586,11 +641,12 @@ impl Runtime {
         let (tx, rx) = channel::unbounded();
         let (forwarder_tx, forwarder_rx) = mpsc::channel(1024);
         let connections = Arc::new(Mutex::new(HashMap::new()));
+        let pending_interrupts = Arc::new(Mutex::new(HashMap::new()));
 
         let worker_count = worker_count
             .unwrap_or_else(|| registry.list().len().max(1))
             .max(1);
-        let worker_layout = build_worker_layout(Arc::clone(&registry), worker_count);
+        let worker_layout = build_worker_layout(Arc::clone(&registry), worker_count, tx.clone());
         let router_worker_senders = worker_layout
             .iter()
             .map(|worker| WorkerRoute {
@@ -599,7 +655,15 @@ impl Runtime {
             })
             .collect::<Vec<_>>();
         let router_registry = Arc::clone(&registry);
-        let router = thread::spawn(move || router_loop(router_registry, rx, router_worker_senders));
+        let router_pending_interrupts = Arc::clone(&pending_interrupts);
+        let router = thread::spawn(move || {
+            router_loop(
+                router_registry,
+                rx,
+                router_worker_senders,
+                router_pending_interrupts,
+            )
+        });
         let forwarder_connections = Arc::clone(&connections);
         let forwarder_router_tx = tx.clone();
         let forwarder = thread::spawn(move || {
@@ -611,6 +675,7 @@ impl Runtime {
             tx,
             next_connection_id: AtomicU64::new(1),
             connections,
+            pending_interrupts,
             forwarder_tx,
             router: Some(router),
             forwarder: Some(forwarder),
@@ -638,6 +703,9 @@ impl Runtime {
         let _ = self.forwarder_tx.try_send(ForwarderSignal::Shutdown);
         if let Ok(mut connections) = self.connections.lock() {
             connections.clear();
+        }
+        if let Ok(mut interrupts) = self.pending_interrupts.lock() {
+            interrupts.clear();
         }
     }
 
@@ -760,6 +828,38 @@ struct ConnectionEntry {
     rx: mpsc::UnboundedReceiver<ConnectionRequest>,
 }
 
+#[derive(Clone)]
+struct GenerationCancellation {
+    requested: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl GenerationCancellation {
+    fn new() -> Self {
+        Self {
+            requested: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    fn request(&self) {
+        if !self.requested.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        if self.is_requested() {
+            return;
+        }
+        self.notify.notified().await;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForwarderSignal {
     Ready(ConnectionId),
@@ -825,11 +925,21 @@ enum WorkerRequest {
         sequence_number: Option<u64>,
         response: Option<mpsc::UnboundedSender<RuntimeResponseEvent>>,
         reply: Option<oneshot::Sender<Result<String, RuntimeError>>>,
+        cancellation: GenerationCancellation,
+    },
+    Interrupt {
+        connection_id: ConnectionId,
+        sequence_number: u64,
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
     Shutdown,
 }
 
-fn build_worker_layout(registry: Arc<RuntimeRegistry>, worker_count: usize) -> Vec<WorkerHandle> {
+fn build_worker_layout(
+    registry: Arc<RuntimeRegistry>,
+    worker_count: usize,
+    router_tx: channel::Sender<RuntimeRequest>,
+) -> Vec<WorkerHandle> {
     let configs = registry.list();
     if configs.is_empty() {
         return Vec::new();
@@ -842,7 +952,8 @@ fn build_worker_layout(registry: Arc<RuntimeRegistry>, worker_count: usize) -> V
         let (tx, rx) = channel::unbounded();
         let config_id = config.id.clone();
         let worker_registry = Arc::clone(&registry);
-        let join = thread::spawn(move || worker_loop(worker_registry, rx));
+        let router_tx = router_tx.clone();
+        let join = thread::spawn(move || worker_loop(worker_registry, rx, router_tx));
 
         workers.push(WorkerHandle {
             config_id,
@@ -901,6 +1012,20 @@ fn connection_forwarder_loop(
                         Ok(ConnectionRequest::Close { reply }) => {
                             disconnect = Some(Some(reply));
                             break;
+                        }
+                        Ok(ConnectionRequest::Interrupt {
+                            sequence_number,
+                            reply,
+                        }) => {
+                            if let Err(err) = router_tx.send(RuntimeRequest::Interrupt {
+                                config_id: entry.config_id.clone(),
+                                connection_id,
+                                sequence_number,
+                                reply,
+                            }) && let RuntimeRequest::Interrupt { reply, .. } = err.into_inner()
+                            {
+                                let _ = reply.send(Err(RuntimeError::ChannelClosed));
+                            }
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -966,6 +1091,7 @@ fn router_loop(
     registry: Arc<RuntimeRegistry>,
     rx: channel::Receiver<RuntimeRequest>,
     workers: Vec<WorkerRoute>,
+    pending_interrupts: Arc<Mutex<HashMap<(ConnectionId, u64), GenerationCancellation>>>,
 ) {
     let mut worker_map = HashMap::new();
     for worker in workers {
@@ -1017,6 +1143,18 @@ fn router_loop(
                 response,
                 reply,
             } => {
+                let cancellation = match (connection_id, sequence_number) {
+                    (Some(connection_id), Some(sequence_number)) => {
+                        let mut pending = pending_interrupts
+                            .lock()
+                            .expect("pending interrupt registry poisoned");
+                        pending
+                            .entry((connection_id, sequence_number))
+                            .or_insert_with(GenerationCancellation::new)
+                            .clone()
+                    }
+                    _ => GenerationCancellation::new(),
+                };
                 route_generate(
                     &registry,
                     &worker_map,
@@ -1027,7 +1165,53 @@ fn router_loop(
                     sequence_number,
                     response,
                     reply,
+                    cancellation,
                 );
+            }
+            RuntimeRequest::Interrupt {
+                config_id,
+                connection_id,
+                sequence_number,
+                reply,
+            } => match worker_map.get(&config_id) {
+                Some(worker_tx) => {
+                    let cancellation = {
+                        let mut pending = pending_interrupts
+                            .lock()
+                            .expect("pending interrupt registry poisoned");
+                        pending
+                            .entry((connection_id, sequence_number))
+                            .or_insert_with(GenerationCancellation::new)
+                            .clone()
+                    };
+                    cancellation.request();
+                    if let Err(err) = worker_tx.send(WorkerRequest::Interrupt {
+                        connection_id,
+                        sequence_number,
+                        reply,
+                    }) {
+                        match err.into_inner() {
+                            WorkerRequest::Interrupt { reply, .. } => {
+                                let _ = reply.send(Err(RuntimeError::ChannelClosed));
+                            }
+                            WorkerRequest::Load { .. }
+                            | WorkerRequest::Unload { .. }
+                            | WorkerRequest::Generate { .. }
+                            | WorkerRequest::Shutdown => {}
+                        }
+                    }
+                }
+                None => {
+                    let _ = reply.send(Err(RuntimeError::UnknownConfig(config_id)));
+                }
+            },
+            RuntimeRequest::ClearInterrupt {
+                connection_id,
+                sequence_number,
+            } => {
+                if let Ok(mut pending) = pending_interrupts.lock() {
+                    pending.remove(&(connection_id, sequence_number));
+                }
             }
             RuntimeRequest::Shutdown => {
                 for worker in worker_map.values() {
@@ -1049,6 +1233,7 @@ fn route_generate(
     sequence_number: Option<u64>,
     response: Option<mpsc::UnboundedSender<RuntimeResponseEvent>>,
     reply: Option<oneshot::Sender<Result<String, RuntimeError>>>,
+    cancellation: GenerationCancellation,
 ) {
     match registry.get(&config_id) {
         Some(config) => match worker_map.get(&config.id) {
@@ -1067,6 +1252,7 @@ fn route_generate(
                     sequence_number,
                     response,
                     reply,
+                    cancellation,
                 };
 
                 if let Err(err) = worker_tx.send(worker_request) {
@@ -1092,6 +1278,7 @@ fn route_generate(
                             }
                         }
                         WorkerRequest::Load { .. }
+                        | WorkerRequest::Interrupt { .. }
                         | WorkerRequest::Unload { .. }
                         | WorkerRequest::Shutdown => {}
                     }
@@ -1129,7 +1316,11 @@ fn route_generate(
     }
 }
 
-fn worker_loop(registry: Arc<RuntimeRegistry>, rx: channel::Receiver<WorkerRequest>) {
+fn worker_loop(
+    registry: Arc<RuntimeRegistry>,
+    rx: channel::Receiver<WorkerRequest>,
+    router_tx: channel::Sender<RuntimeRequest>,
+) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1175,7 +1366,9 @@ fn worker_loop(registry: Arc<RuntimeRegistry>, rx: channel::Receiver<WorkerReque
                 sequence_number,
                 response,
                 reply,
+                cancellation,
             } => {
+                let clear_key = connection_id.zip(sequence_number);
                 let response = runtime.block_on(async {
                     run_generation(
                         &registry,
@@ -1186,6 +1379,7 @@ fn worker_loop(registry: Arc<RuntimeRegistry>, rx: channel::Receiver<WorkerReque
                         connection_id,
                         sequence_number,
                         response,
+                        cancellation,
                     )
                     .await
                 });
@@ -1193,6 +1387,19 @@ fn worker_loop(registry: Arc<RuntimeRegistry>, rx: channel::Receiver<WorkerReque
                 if let Some(reply) = reply {
                     let _ = reply.send(response);
                 }
+                if let Some((connection_id, sequence_number)) = clear_key {
+                    let _ = router_tx.send(RuntimeRequest::ClearInterrupt {
+                        connection_id,
+                        sequence_number,
+                    });
+                }
+            }
+            WorkerRequest::Interrupt {
+                connection_id: _connection_id,
+                sequence_number: _sequence_number,
+                reply,
+            } => {
+                let _ = reply.send(Ok(()));
             }
             WorkerRequest::Shutdown => break,
         }
@@ -1208,6 +1415,7 @@ async fn run_generation(
     connection_id: Option<ConnectionId>,
     sequence_number: Option<u64>,
     response: Option<mpsc::UnboundedSender<RuntimeResponseEvent>>,
+    cancellation: GenerationCancellation,
 ) -> Result<String, RuntimeError> {
     let config = registry
         .get(&config.id)
@@ -1322,147 +1530,176 @@ async fn run_generation(
         }
     };
 
-    while let Some(response_event) = stream.next().await {
-        match response_event {
-            Response::Chunk(chunk) => {
-                let model_name = chunk.model.clone();
-                let usage = chunk.usage;
-                let mut finish_reason = None;
+    let emit_interrupted = || {
+        if let (Some(response), Some(connection_id), Some(sequence_number)) =
+            (response.as_ref(), connection_id, sequence_number)
+        {
+            let _ = response.send(RuntimeResponseEvent::Interrupted {
+                connection_id,
+                sequence_number,
+            });
+        }
+    };
 
-                for choice in chunk.choices {
-                    if choice.finish_reason.is_some() {
-                        finish_reason = choice.finish_reason.clone();
-                    }
-
-                    if let Some(content) = choice.delta.content {
-                        if content.is_empty() {
-                            continue;
-                        }
-
-                        chunk_count += 1;
-                        streamed_content.push_str(&content);
-                        emit_chunk(&content);
-                        tracing::info!(
-                            config_id = %config.id,
-                            repo_id = %config.model.repo_id(),
-                            model = %model_name,
-                            chunk_count,
-                            chunk_chars = content.chars().count(),
-                            response_chars = streamed_content.chars().count(),
-                            delta = %content.escape_debug(),
-                            "generation token chunk"
-                        );
-                    }
-                }
-
-                if let Some(usage) = usage {
-                    tracing::info!(
-                        config_id = %config.id,
-                        repo_id = %config.model.repo_id(),
-                        model = %model_name,
-                        chunk_count,
-                        finish_reason = finish_reason.as_deref().unwrap_or("unknown"),
-                        prompt_tokens = usage.prompt_tokens,
-                        completion_tokens = usage.completion_tokens,
-                        total_tokens = usage.total_tokens,
-                        avg_tok_per_sec = usage.avg_tok_per_sec,
-                        avg_prompt_tok_per_sec = usage.avg_prompt_tok_per_sec,
-                        avg_completion_tok_per_sec = usage.avg_compl_tok_per_sec,
-                        total_time_sec = usage.total_time_sec,
-                        prompt_time_sec = usage.total_prompt_time_sec,
-                        completion_time_sec = usage.total_completion_time_sec,
-                        response_chars = streamed_content.chars().count(),
-                        "generation completed"
-                    );
-
-                    emit_complete();
-                    return Ok(streamed_content);
-                }
-
-                if let Some(finish_reason) = finish_reason {
-                    tracing::warn!(
-                        config_id = %config.id,
-                        repo_id = %config.model.repo_id(),
-                        model = %model_name,
-                        chunk_count,
-                        finish_reason,
-                        response_chars = streamed_content.chars().count(),
-                        "generation stream finished without usage"
-                    );
-
-                    emit_complete();
-                    return Ok(streamed_content);
-                }
-            }
-            Response::Done(response) => {
-                let usage = &response.usage;
-                let final_content = response
-                    .choices
-                    .first()
-                    .and_then(|choice| choice.message.content.as_ref())
-                    .filter(|content| !content.is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| streamed_content.clone());
-
-                if streamed_content.is_empty() && !final_content.is_empty() {
-                    emit_chunk(&final_content);
-                }
-
+    loop {
+        tokio::select! {
+            _ = cancellation.cancelled() => {
                 tracing::info!(
                     config_id = %config.id,
                     repo_id = %config.model.repo_id(),
-                    model = %response.model,
-                    chunk_count,
-                    prompt_tokens = usage.prompt_tokens,
-                    completion_tokens = usage.completion_tokens,
-                    total_tokens = usage.total_tokens,
-                    avg_tok_per_sec = usage.avg_tok_per_sec,
-                    avg_prompt_tok_per_sec = usage.avg_prompt_tok_per_sec,
-                    avg_completion_tok_per_sec = usage.avg_compl_tok_per_sec,
-                    total_time_sec = usage.total_time_sec,
-                    prompt_time_sec = usage.total_prompt_time_sec,
-                    completion_time_sec = usage.total_completion_time_sec,
-                    response_chars = final_content.chars().count(),
-                    "generation completed"
+                    response_chars = streamed_content.chars().count(),
+                    "generation interrupted"
                 );
+                emit_interrupted();
+                return Ok(streamed_content);
+            }
+            event = stream.next() => {
+                let Some(response_event) = event else {
+                    break;
+                };
 
-                emit_complete();
-                return Ok(final_content);
-            }
-            Response::ModelError(message, response) => {
-                let error = RuntimeError::Inference(format!("{message}: {:?}", response.choices));
-                emit_error(error);
-                return Err(RuntimeError::Inference(format!(
-                    "{message}: {:?}",
-                    response.choices
-                )));
-            }
-            Response::InternalError(err) | Response::ValidationError(err) => {
-                let error = RuntimeError::Inference(err.to_string());
-                emit_error(error);
-                return Err(RuntimeError::Inference(err.to_string()));
-            }
-            Response::CompletionModelError(message, _) => {
-                let error = RuntimeError::Inference(format!(
-                    "unexpected completion error while generating chat: {message}"
-                ));
-                emit_error(error);
-                return Err(RuntimeError::Inference(format!(
-                    "unexpected completion error while generating chat: {message}"
-                )));
-            }
-            Response::CompletionDone(_)
-            | Response::CompletionChunk(_)
-            | Response::ImageGeneration(_)
-            | Response::Speech { .. }
-            | Response::Raw { .. }
-            | Response::Embeddings { .. } => {
-                let error =
-                    RuntimeError::Inference("unexpected non-chat streaming response".into());
-                emit_error(error);
-                return Err(RuntimeError::Inference(
-                    "unexpected non-chat streaming response".into(),
-                ));
+                match response_event {
+                    Response::Chunk(chunk) => {
+                        let model_name = chunk.model.clone();
+                        let usage = chunk.usage;
+                        let mut finish_reason = None;
+
+                        for choice in chunk.choices {
+                            if choice.finish_reason.is_some() {
+                                finish_reason = choice.finish_reason.clone();
+                            }
+
+                            if let Some(content) = choice.delta.content {
+                                if content.is_empty() {
+                                    continue;
+                                }
+
+                                chunk_count += 1;
+                                streamed_content.push_str(&content);
+                                emit_chunk(&content);
+                                tracing::info!(
+                                    config_id = %config.id,
+                                    repo_id = %config.model.repo_id(),
+                                    model = %model_name,
+                                    chunk_count,
+                                    chunk_chars = content.chars().count(),
+                                    response_chars = streamed_content.chars().count(),
+                                    delta = %content.escape_debug(),
+                                    "generation token chunk"
+                                );
+                            }
+                        }
+
+                        if let Some(usage) = usage {
+                            tracing::info!(
+                                config_id = %config.id,
+                                repo_id = %config.model.repo_id(),
+                                model = %model_name,
+                                chunk_count,
+                                finish_reason = finish_reason.as_deref().unwrap_or("unknown"),
+                                prompt_tokens = usage.prompt_tokens,
+                                completion_tokens = usage.completion_tokens,
+                                total_tokens = usage.total_tokens,
+                                avg_tok_per_sec = usage.avg_tok_per_sec,
+                                avg_prompt_tok_per_sec = usage.avg_prompt_tok_per_sec,
+                                avg_completion_tok_per_sec = usage.avg_compl_tok_per_sec,
+                                total_time_sec = usage.total_time_sec,
+                                prompt_time_sec = usage.total_prompt_time_sec,
+                                completion_time_sec = usage.total_completion_time_sec,
+                                response_chars = streamed_content.chars().count(),
+                                "generation completed"
+                            );
+
+                            emit_complete();
+                            return Ok(streamed_content);
+                        }
+
+                        if let Some(finish_reason) = finish_reason {
+                            tracing::warn!(
+                                config_id = %config.id,
+                                repo_id = %config.model.repo_id(),
+                                model = %model_name,
+                                chunk_count,
+                                finish_reason,
+                                response_chars = streamed_content.chars().count(),
+                                "generation stream finished without usage"
+                            );
+
+                            emit_complete();
+                            return Ok(streamed_content);
+                        }
+                    }
+                    Response::Done(response) => {
+                        let usage = &response.usage;
+                        let final_content = response
+                            .choices
+                            .first()
+                            .and_then(|choice| choice.message.content.as_ref())
+                            .filter(|content| !content.is_empty())
+                            .cloned()
+                            .unwrap_or_else(|| streamed_content.clone());
+
+                        if streamed_content.is_empty() && !final_content.is_empty() {
+                            emit_chunk(&final_content);
+                        }
+
+                        tracing::info!(
+                            config_id = %config.id,
+                            repo_id = %config.model.repo_id(),
+                            model = %response.model,
+                            chunk_count,
+                            prompt_tokens = usage.prompt_tokens,
+                            completion_tokens = usage.completion_tokens,
+                            total_tokens = usage.total_tokens,
+                            avg_tok_per_sec = usage.avg_tok_per_sec,
+                            avg_prompt_tok_per_sec = usage.avg_prompt_tok_per_sec,
+                            avg_completion_tok_per_sec = usage.avg_compl_tok_per_sec,
+                            total_time_sec = usage.total_time_sec,
+                            prompt_time_sec = usage.total_prompt_time_sec,
+                            completion_time_sec = usage.total_completion_time_sec,
+                            response_chars = final_content.chars().count(),
+                            "generation completed"
+                        );
+
+                        emit_complete();
+                        return Ok(final_content);
+                    }
+                    Response::ModelError(message, response) => {
+                        let error = RuntimeError::Inference(format!("{message}: {:?}", response.choices));
+                        emit_error(error);
+                        return Err(RuntimeError::Inference(format!(
+                            "{message}: {:?}",
+                            response.choices
+                        )));
+                    }
+                    Response::InternalError(err) | Response::ValidationError(err) => {
+                        let error = RuntimeError::Inference(err.to_string());
+                        emit_error(error);
+                        return Err(RuntimeError::Inference(err.to_string()));
+                    }
+                    Response::CompletionModelError(message, _) => {
+                        let error = RuntimeError::Inference(format!(
+                            "unexpected completion error while generating chat: {message}"
+                        ));
+                        emit_error(error);
+                        return Err(RuntimeError::Inference(format!(
+                            "unexpected completion error while generating chat: {message}"
+                        )));
+                    }
+                    Response::CompletionDone(_)
+                    | Response::CompletionChunk(_)
+                    | Response::ImageGeneration(_)
+                    | Response::Speech { .. }
+                    | Response::Raw { .. }
+                    | Response::Embeddings { .. } => {
+                        let error =
+                            RuntimeError::Inference("unexpected non-chat streaming response".into());
+                        emit_error(error);
+                        return Err(RuntimeError::Inference(
+                            "unexpected non-chat streaming response".into(),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -2037,6 +2274,7 @@ mod tests {
             tx,
             next_connection_id: AtomicU64::new(1),
             connections: Arc::new(Mutex::new(HashMap::new())),
+            pending_interrupts: Arc::new(Mutex::new(HashMap::new())),
             forwarder_tx,
             router: None,
             forwarder: None,

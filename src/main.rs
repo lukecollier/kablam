@@ -10,17 +10,21 @@ use std::io::{self as std_io, ErrorKind};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent::{ToolParameter, ToolParameterKind, ToolSpec};
+use agent::{
+    MarkdownAccumulator, ParsedMarkdown, ToolParameter, ToolParameterKind, ToolSpec,
+    blocks_to_raw_text,
+};
 use arboard::Clipboard;
 use command_palette::{
     CommandCommit, CommandDispatch, CommandPaletteState, CommandParseError, TabTarget,
 };
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind};
+use mdstream::Block as MarkdownBlock;
 use mistralrs::{RequestBuilder, RequestLike, TextMessageRole, TextMessages};
 use runtime::{RuntimeBuilder, RuntimeConnection, RuntimeResponseEvent, RuntimeStatus};
 use terminal::{
-    AssistantStatus, HistoryEntry, Mode, ModelLoadStatus, RenderState, ScrollAnchor,
-    TabRenderInfo, TerminalUi, chat_entry_positions, clipboard_text, selected_transcript_index,
+    AssistantStatus, HistoryEntry, Mode, ModelLoadStatus, RenderState, ScrollAnchor, TabRenderInfo,
+    TerminalUi, chat_entry_positions, clipboard_text, selected_transcript_index,
 };
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -28,7 +32,7 @@ use tracing_subscriber::filter::LevelFilter;
 
 const SYSTEM_PROMPT: &str = "You are a concise assistant. If a user asks for information that an available tool can provide, call the tool instead of answering directly.";
 const LOG_FILE: &str = "logs/kablam.log";
-const MAX_GENERATION_TOKENS: usize = 512;
+const MAX_GENERATION_TOKENS: usize = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposeTarget {
@@ -117,8 +121,10 @@ struct ThreadState {
     scroll_anchor: ScrollAnchor,
     queue: VecDeque<ThreadJob>,
     running_job: bool,
+    running_assistant_id: Option<u64>,
     loaded_models: HashSet<String>,
     connections: HashMap<String, RuntimeConnection>,
+    has_unseen_changes: bool,
 }
 
 struct AppState {
@@ -153,12 +159,18 @@ enum JobEvent {
     Chunk {
         tab_id: usize,
         assistant_entry_id: u64,
-        content: String,
+        markdown: ParsedMarkdown,
     },
     Complete {
         tab_id: usize,
         assistant_entry_id: u64,
+        markdown: ParsedMarkdown,
         callouts: Vec<String>,
+    },
+    Interrupted {
+        tab_id: usize,
+        assistant_entry_id: u64,
+        markdown: ParsedMarkdown,
     },
     Error {
         tab_id: usize,
@@ -216,8 +228,10 @@ async fn main() {
         scroll_anchor: ScrollAnchor::Bottom,
         queue: VecDeque::new(),
         running_job: false,
+        running_assistant_id: None,
         loaded_models: HashSet::new(),
         connections: HashMap::from([(startup.model.clone(), initial_connection)]),
+        has_unseen_changes: false,
     };
 
     let mut app = AppState {
@@ -255,57 +269,42 @@ async fn main() {
         return;
     }
 
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-
     loop {
-        tokio::select! {
-            _ = &mut ctrl_c => {
+        let Some(event) = event_rx.recv().await else {
+            break;
+        };
+
+        let outcome = match event {
+            AppEvent::Input(event) => {
+                handle_input_event(event, &mut app, &runtime, &tools, event_tx.clone()).await
+            }
+            AppEvent::Tick => Ok(AppAction::Continue),
+            AppEvent::Job(event) => {
+                handle_job_event(event, &mut app, &runtime, &tools, event_tx.clone()).await;
+                Ok(AppAction::Continue)
+            }
+        };
+
+        match outcome {
+            Ok(AppAction::Continue) => {
+                normalize_selection(active_thread_mut(&mut app));
+                if let Err(err) = redraw(&mut ui, &app) {
+                    eprintln!("failed to redraw UI: {err}");
+                    runtime.request_shutdown();
+                    break;
+                }
+            }
+            Ok(AppAction::Quit) => {
                 runtime.request_shutdown();
                 break;
             }
-            event = event_rx.recv() => {
-                let Some(event) = event else {
+            Err(err) => {
+                if err.kind() == ErrorKind::Interrupted {
                     break;
-                };
-
-                let outcome = match event {
-                    AppEvent::Input(event) => handle_input_event(
-                        event,
-                        &mut app,
-                        &runtime,
-                        &tools,
-                        event_tx.clone(),
-                    ).await,
-                    AppEvent::Tick => Ok(AppAction::Continue),
-                    AppEvent::Job(event) => {
-                        handle_job_event(event, &mut app, &runtime, &tools, event_tx.clone()).await;
-                        Ok(AppAction::Continue)
-                    }
-                };
-
-                match outcome {
-                    Ok(AppAction::Continue) => {
-                        normalize_selection(active_thread_mut(&mut app));
-                        if let Err(err) = redraw(&mut ui, &app) {
-                            eprintln!("failed to redraw UI: {err}");
-                            runtime.request_shutdown();
-                            break;
-                        }
-                    }
-                    Ok(AppAction::Quit) => {
-                        runtime.request_shutdown();
-                        break;
-                    }
-                    Err(err) => {
-                        if err.kind() == ErrorKind::Interrupted {
-                            break;
-                        }
-                        eprintln!("input handling failed: {err}");
-                        runtime.request_shutdown();
-                        break;
-                    }
                 }
+                eprintln!("input handling failed: {err}");
+                runtime.request_shutdown();
+                break;
             }
         }
     }
@@ -329,14 +328,26 @@ async fn handle_input_event(
     app.command_palette.set_tab_labels(tab_labels(&app.threads));
 
     match event {
-        Event::Key(key) => match app.mode {
-            Mode::Insert => handle_insert_key_event(key, app, runtime, tools, app_tx).await,
-            Mode::Normal => handle_normal_key_event(key, app),
-            Mode::Command => handle_command_key_event(key, app, runtime, tools, app_tx).await,
-            Mode::ConfirmDelete => {
-                handle_confirm_delete_key_event(key, app, runtime, tools, app_tx).await
+        Event::Key(key) => {
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                return handle_ctrl_c(app).await;
             }
-        },
+            if matches!(key.code, KeyCode::Left | KeyCode::Right)
+                && !matches!(app.mode, Mode::Command | Mode::ConfirmDelete)
+            {
+                cycle_active_tab_relative(app, if key.code == KeyCode::Left { -1 } else { 1 });
+                return Ok(AppAction::Continue);
+            }
+
+            match app.mode {
+                Mode::Insert => handle_insert_key_event(key, app, runtime, tools, app_tx).await,
+                Mode::Normal => handle_normal_key_event(key, app),
+                Mode::Command => handle_command_key_event(key, app, runtime, tools, app_tx).await,
+                Mode::ConfirmDelete => {
+                    handle_confirm_delete_key_event(key, app, runtime, tools, app_tx).await
+                }
+            }
+        }
         Event::Mouse(mouse) => {
             handle_mouse_event(mouse.kind, app);
             Ok(AppAction::Continue)
@@ -371,14 +382,45 @@ async fn handle_insert_key_event(
             thread.draft.pop();
         }
         KeyCode::Char(ch)
-            if !key.modifiers.intersects(
-                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-            ) =>
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
         {
             thread.draft.push(ch);
         }
         _ => {}
     }
+
+    Ok(AppAction::Continue)
+}
+
+async fn handle_ctrl_c(app: &mut AppState) -> std_io::Result<AppAction> {
+    let Some((thread_index, assistant_id, sequence_number)) = selected_interrupt_target(app) else {
+        return Ok(AppAction::Quit);
+    };
+
+    let model_id = app.threads[thread_index].current_config.model_id.clone();
+    let Some(connection) = app.threads[thread_index]
+        .connections
+        .get(&model_id)
+        .cloned()
+    else {
+        return Ok(AppAction::Continue);
+    };
+
+    if let Some(sequence_number) = sequence_number {
+        connection
+            .interrupt_sequence(sequence_number)
+            .await
+            .map_err(|err| std_io::Error::other(err.to_string()))?;
+    } else {
+        cancel_queued_assistant(app, thread_index, assistant_id);
+    }
+    tracing::info!(
+        tab_id = app.threads[thread_index].tab_id,
+        assistant_entry_id = assistant_id,
+        "interrupt requested for running assistant"
+    );
 
     Ok(AppAction::Continue)
 }
@@ -464,6 +506,8 @@ fn handle_normal_key_event(
                 app.mode = Mode::ConfirmDelete;
             }
         }
+        KeyCode::Left => cycle_active_tab_relative(app, -1),
+        KeyCode::Right => cycle_active_tab_relative(app, 1),
         KeyCode::Tab => cycle_active_tab(app),
         _ => {}
     }
@@ -499,9 +543,9 @@ async fn handle_command_key_event(
         },
         KeyCode::Backspace => app.command_palette.backspace(),
         KeyCode::Char(ch)
-            if !key.modifiers.intersects(
-                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-            ) =>
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
         {
             app.command_palette.input_char(ch)
         }
@@ -656,7 +700,7 @@ async fn execute_command_dispatch(
         }
         CommandDispatch::ActivateTab(target) => {
             if let Some(index) = resolve_tab_target(&app.threads, &target) {
-                app.active_thread_idx = index;
+                activate_thread_index(app, index);
                 close_command_mode(app);
             } else {
                 app.command_palette.set_error(format!(
@@ -698,10 +742,12 @@ async fn execute_command_dispatch(
                 scroll_anchor: ScrollAnchor::Bottom,
                 queue: VecDeque::new(),
                 running_job: false,
+                running_assistant_id: None,
                 loaded_models: HashSet::new(),
                 connections: HashMap::from([(model_id, connection)]),
+                has_unseen_changes: false,
             });
-            app.active_thread_idx = app.threads.len() - 1;
+            activate_thread_index(app, app.threads.len() - 1);
             close_command_mode(app);
             Ok(AppAction::Continue)
         }
@@ -736,9 +782,10 @@ async fn execute_command_dispatch(
             if let Some(index) = resolve_tab_target(&app.threads, &target) {
                 let mut thread = app.threads.remove(index);
                 close_thread_connections(&mut thread).await;
-                app.active_thread_idx = app
+                let next_index = app
                     .active_thread_idx
                     .min(app.threads.len().saturating_sub(1));
+                activate_thread_index(app, next_index);
                 close_command_mode(app);
             } else {
                 app.command_palette.set_error(format!(
@@ -828,15 +875,7 @@ async fn replay_edited_command(
     }
 
     let _ = compacted;
-    enqueue_replay_from_index(
-        app,
-        command_index + 1,
-        replay_end,
-        runtime,
-        tools,
-        app_tx,
-    )
-    .await
+    enqueue_replay_from_index(app, command_index + 1, replay_end, runtime, tools, app_tx).await
 }
 
 async fn delete_history_entry(
@@ -890,18 +929,20 @@ async fn submit_chat_turn(
             if let Some(index) = find_history_index(thread, entry_id) {
                 if let HistoryEntry::Assistant {
                     prompt,
-                    content,
+                    blocks,
                     callouts,
                     status,
+                    sequence_number,
                     ..
                 } = &mut thread.history[index].entry
                 {
                     *prompt = input;
-                    content.clear();
+                    blocks.clear();
                     callouts.clear();
                     *status = Some(AssistantStatus::Queued {
                         started_at: Instant::now(),
                     });
+                    *sequence_number = None;
                 }
                 thread.selected_chat_entry = Some(index);
                 thread.queue.clear();
@@ -994,12 +1035,15 @@ async fn enqueue_replay_from_index(
         let thread = active_thread(app);
         (start_index..effective_end)
             .filter_map(|index| {
-                thread.history.get(index).and_then(|item| match &item.entry {
-                    HistoryEntry::Assistant { model_id, .. } => {
-                        Some((index, item.id, model_id.clone()))
-                    }
-                    _ => None,
-                })
+                thread
+                    .history
+                    .get(index)
+                    .and_then(|item| match &item.entry {
+                        HistoryEntry::Assistant { model_id, .. } => {
+                            Some((index, item.id, model_id.clone()))
+                        }
+                        _ => None,
+                    })
             })
             .collect::<Vec<_>>()
     };
@@ -1019,17 +1063,19 @@ async fn enqueue_replay_from_index(
             }
             if let Some(item) = thread.history.get_mut(*index) {
                 if let HistoryEntry::Assistant {
-                    content,
+                    blocks,
                     callouts,
                     status,
+                    sequence_number,
                     ..
                 } = &mut item.entry
                 {
-                    content.clear();
+                    blocks.clear();
                     callouts.clear();
                     *status = Some(AssistantStatus::Queued {
                         started_at: Instant::now(),
                     });
+                    *sequence_number = None;
                 }
             }
             thread.queue.push_back(ThreadJob {
@@ -1097,7 +1143,6 @@ async fn start_next_job_for_thread(
         .get(&config.model_id)
         .expect("connection should exist")
         .clone();
-    app.threads[thread_index].running_job = true;
     if !app.threads[thread_index]
         .loaded_models
         .contains(&config.model_id)
@@ -1112,24 +1157,38 @@ async fn start_next_job_for_thread(
     }
 
     let tools = tools.to_vec();
-    tokio::spawn(async move {
-        let (status_tx, mut status_rx) = mpsc::unbounded_channel();
-        let mut stream = match connection
-            .stream_with_status(request, Some(status_tx))
-            .await
-        {
-            Ok(stream) => stream,
-            Err(err) => {
-                let _ = app_tx.send(AppEvent::Job(JobEvent::Error {
-                    tab_id,
-                    assistant_entry_id: job.assistant_entry_id,
-                    error: format!("runtime error: {err}"),
-                }));
-                return;
-            }
-        };
+    let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+    let mut stream = match connection
+        .stream_with_status(request, Some(status_tx))
+        .await
+    {
+        Ok(stream) => stream,
+        Err(err) => {
+            let _ = app_tx.send(AppEvent::Job(JobEvent::Error {
+                tab_id,
+                assistant_entry_id: job.assistant_entry_id,
+                error: format!("runtime error: {err}"),
+            }));
+            app.threads[thread_index].running_job = false;
+            app.threads[thread_index].running_assistant_id = None;
+            app.threads[thread_index].queue.push_front(job);
+            return Ok(());
+        }
+    };
+    app.threads[thread_index].running_job = true;
+    app.threads[thread_index].running_assistant_id = Some(job.assistant_entry_id);
+    let sequence_number = stream.sequence_number();
+    if let Some(index) = find_history_index(&app.threads[thread_index], job.assistant_entry_id)
+        && let HistoryEntry::Assistant {
+            sequence_number: entry_sequence,
+            ..
+        } = &mut app.threads[thread_index].history[index].entry
+    {
+        *entry_sequence = Some(sequence_number);
+    }
 
-        let mut response = String::new();
+    tokio::spawn(async move {
+        let mut markdown = MarkdownAccumulator::new(tool_format);
         loop {
             tokio::select! {
                 status = status_rx.recv() => {
@@ -1144,23 +1203,44 @@ async fn start_next_job_for_thread(
                 event = stream.next() => {
                     match event {
                         Some(RuntimeResponseEvent::Chunk { content, .. }) => {
-                            response.push_str(&content);
+                            let parsed = markdown.append(&content);
+                            if parsed.tool_call_detected {
+                                tracing::info!(
+                                    tab_id,
+                                    assistant_entry_id = job.assistant_entry_id,
+                                    "tool called"
+                                );
+                            }
                             let _ = app_tx.send(AppEvent::Job(JobEvent::Chunk {
                                 tab_id,
                                 assistant_entry_id: job.assistant_entry_id,
-                                content,
+                                markdown: parsed,
                             }));
                         }
                         Some(RuntimeResponseEvent::Complete { .. }) => {
+                            let parsed = markdown.finalize();
                             let callouts = if config.tools_enabled {
-                                parsed_tool_callouts(tool_format.parse(&response), &tools)
+                                parsed_tool_callouts(
+                                    tool_format.parse(&blocks_to_raw_text(&parsed.blocks)),
+                                    &tools,
+                                )
                             } else {
                                 Vec::new()
                             };
                             let _ = app_tx.send(AppEvent::Job(JobEvent::Complete {
                                 tab_id,
                                 assistant_entry_id: job.assistant_entry_id,
+                                markdown: parsed,
                                 callouts,
+                            }));
+                            break;
+                        }
+                        Some(RuntimeResponseEvent::Interrupted { .. }) => {
+                            let parsed = markdown.finalize();
+                            let _ = app_tx.send(AppEvent::Job(JobEvent::Interrupted {
+                                tab_id,
+                                assistant_entry_id: job.assistant_entry_id,
+                                markdown: parsed,
                             }));
                             break;
                         }
@@ -1206,6 +1286,7 @@ async fn handle_job_event(
             ..
         } => {
             let thread = &mut app.threads[thread_index];
+            mark_thread_changed(thread, thread_index != app.active_thread_idx);
             let model_id = match thread
                 .history
                 .iter()
@@ -1258,18 +1339,65 @@ async fn handle_job_event(
         }
         JobEvent::Chunk {
             assistant_entry_id,
-            content,
+            markdown,
             ..
         } => {
-            append_assistant_chunk(&mut app.threads[thread_index], assistant_entry_id, &content);
+            mark_thread_changed(
+                &mut app.threads[thread_index],
+                thread_index != app.active_thread_idx,
+            );
+            replace_assistant_blocks(
+                &mut app.threads[thread_index],
+                assistant_entry_id,
+                markdown.blocks,
+            );
+            set_assistant_tool_callout(
+                &mut app.threads[thread_index],
+                assistant_entry_id,
+                markdown.tool_call_detected,
+            );
         }
         JobEvent::Complete {
             assistant_entry_id,
+            markdown,
             callouts,
             ..
         } => {
-            finalize_assistant(&mut app.threads[thread_index], assistant_entry_id, callouts);
+            mark_thread_changed(
+                &mut app.threads[thread_index],
+                thread_index != app.active_thread_idx,
+            );
+            finalize_assistant(
+                &mut app.threads[thread_index],
+                assistant_entry_id,
+                markdown.blocks,
+                merge_tool_call_callout(markdown.tool_call_detected, callouts),
+            );
             app.threads[thread_index].running_job = false;
+            app.threads[thread_index].running_assistant_id = None;
+            let _ = start_next_job_for_thread(app, thread_index, runtime, tools, app_tx).await;
+        }
+        JobEvent::Interrupted {
+            assistant_entry_id,
+            markdown,
+            ..
+        } => {
+            mark_thread_changed(
+                &mut app.threads[thread_index],
+                thread_index != app.active_thread_idx,
+            );
+            finalize_interrupted_assistant(
+                &mut app.threads[thread_index],
+                assistant_entry_id,
+                markdown.blocks,
+            );
+            set_assistant_tool_callout(
+                &mut app.threads[thread_index],
+                assistant_entry_id,
+                markdown.tool_call_detected,
+            );
+            app.threads[thread_index].running_job = false;
+            app.threads[thread_index].running_assistant_id = None;
             let _ = start_next_job_for_thread(app, thread_index, runtime, tools, app_tx).await;
         }
         JobEvent::Error {
@@ -1281,6 +1409,7 @@ async fn handle_job_event(
                 &mut app.threads[thread_index],
                 assistant_entry_id,
                 Vec::new(),
+                Vec::new(),
             );
             let notice_id = next_history_id(app);
             push_history_entry(
@@ -1290,6 +1419,7 @@ async fn handle_job_event(
                 HistoryMeta::None,
             );
             app.threads[thread_index].running_job = false;
+            app.threads[thread_index].running_assistant_id = None;
             let _ = start_next_job_for_thread(app, thread_index, runtime, tools, app_tx).await;
         }
     }
@@ -1343,15 +1473,23 @@ fn build_request_for_turn(
         }
     }
 
-    for item in thread.history.iter().skip(start_index).take(target_index + 1 - start_index) {
+    for item in thread
+        .history
+        .iter()
+        .skip(start_index)
+        .take(target_index + 1 - start_index)
+    {
         match &item.entry {
             HistoryEntry::Assistant {
                 prompt,
-                content, status, ..
+                blocks,
+                status,
+                ..
             } => {
                 messages = messages.add_message(TextMessageRole::User, prompt);
                 if status.is_none() {
-                    messages = messages.add_message(TextMessageRole::Assistant, content);
+                    messages = messages
+                        .add_message(TextMessageRole::Assistant, blocks_to_raw_text(blocks));
                 }
             }
             HistoryEntry::LoadingModel { .. } => {}
@@ -1477,6 +1615,7 @@ fn tab_render_info(threads: &[ThreadState]) -> Vec<TabRenderInfo> {
         .zip(tab_labels(threads))
         .map(|(thread, label)| TabRenderInfo {
             label: format!("{}. {}", thread.tab_id, label),
+            has_unseen: thread.has_unseen_changes,
         })
         .collect()
 }
@@ -1585,9 +1724,10 @@ fn insert_assistant_turn_at(
             entry: HistoryEntry::Assistant {
                 model_id,
                 prompt,
-                content: String::new(),
+                blocks: Vec::new(),
                 callouts: Vec::new(),
                 status,
+                sequence_number: None,
             },
             meta: HistoryMeta::None,
         },
@@ -1638,7 +1778,10 @@ fn set_loading_status(thread: &mut ThreadState, model_id: &str, status: ModelLoa
                 ..
             } if entry_model_id == model_id
         )
-    }) && let HistoryEntry::LoadingModel { status: entry_status, .. } = &mut item.entry
+    }) && let HistoryEntry::LoadingModel {
+        status: entry_status,
+        ..
+    } = &mut item.entry
     {
         *entry_status = Some(status);
     }
@@ -1656,32 +1799,80 @@ fn set_assistant_status(thread: &mut ThreadState, assistant_id: u64, status: Ass
     }
 }
 
-fn append_assistant_chunk(thread: &mut ThreadState, assistant_id: u64, content: &str) {
+fn replace_assistant_blocks(
+    thread: &mut ThreadState,
+    assistant_id: u64,
+    blocks: Vec<MarkdownBlock>,
+) {
     if let Some(index) = find_history_index(thread, assistant_id) {
         if let HistoryEntry::Assistant {
-            content: assistant_content,
+            blocks: assistant_blocks,
             status,
+            sequence_number,
             ..
         } = &mut thread.history[index].entry
         {
             *status = None;
-            assistant_content.push_str(content);
+            *sequence_number = None;
+            *assistant_blocks = blocks;
         }
     }
 }
 
-fn finalize_assistant(thread: &mut ThreadState, assistant_id: u64, callouts: Vec<String>) {
+fn finalize_assistant(
+    thread: &mut ThreadState,
+    assistant_id: u64,
+    blocks: Vec<MarkdownBlock>,
+    callouts: Vec<String>,
+) {
     if let Some(index) = find_history_index(thread, assistant_id) {
         if let HistoryEntry::Assistant {
+            blocks: entry_blocks,
             callouts: entry_callouts,
             status,
+            sequence_number,
             ..
         } = &mut thread.history[index].entry
         {
+            *entry_blocks = blocks;
             *status = None;
+            *sequence_number = None;
             entry_callouts.extend(callouts);
         }
     }
+}
+
+fn finalize_interrupted_assistant(
+    thread: &mut ThreadState,
+    assistant_id: u64,
+    blocks: Vec<MarkdownBlock>,
+) {
+    if blocks.is_empty() {
+        if let Some(index) = find_history_index(thread, assistant_id) {
+            thread.history.remove(index);
+        }
+        return;
+    }
+
+    finalize_assistant(thread, assistant_id, blocks, Vec::new());
+}
+
+fn set_assistant_tool_callout(thread: &mut ThreadState, assistant_id: u64, detected: bool) {
+    if let Some(index) = find_history_index(thread, assistant_id)
+        && let HistoryEntry::Assistant { callouts, .. } = &mut thread.history[index].entry
+    {
+        callouts.retain(|line| line != "tool called");
+        if detected {
+            callouts.insert(0, String::from("tool called"));
+        }
+    }
+}
+
+fn merge_tool_call_callout(detected: bool, mut callouts: Vec<String>) -> Vec<String> {
+    if detected {
+        callouts.insert(0, String::from("tool called"));
+    }
+    callouts
 }
 
 fn normalize_selection(thread: &mut ThreadState) {
@@ -1738,7 +1929,75 @@ fn cycle_active_tab(app: &mut AppState) {
     if app.threads.is_empty() {
         return;
     }
-    app.active_thread_idx = (app.active_thread_idx + 1) % app.threads.len();
+    cycle_active_tab_relative(app, 1);
+}
+
+fn cycle_active_tab_relative(app: &mut AppState, delta: isize) {
+    if app.threads.is_empty() {
+        return;
+    }
+
+    let len = app.threads.len() as isize;
+    let current = app.active_thread_idx as isize;
+    let next = (current + delta).rem_euclid(len) as usize;
+    activate_thread_index(app, next);
+}
+
+fn activate_thread_index(app: &mut AppState, index: usize) {
+    app.active_thread_idx = index.min(app.threads.len().saturating_sub(1));
+    if let Some(thread) = app.threads.get_mut(app.active_thread_idx) {
+        thread.has_unseen_changes = false;
+    }
+}
+
+fn mark_thread_changed(thread: &mut ThreadState, unseen: bool) {
+    if unseen {
+        thread.has_unseen_changes = true;
+    }
+}
+
+fn selected_interrupt_target(app: &AppState) -> Option<(usize, u64, Option<u64>)> {
+    let thread = active_thread(app);
+    if let Some(selected) = thread.selected_chat_entry
+        && let Some(history_index) = chat_entry_positions(&history_entries(thread)).get(selected)
+        && let Some(HistoryItem {
+            id,
+            entry:
+                HistoryEntry::Assistant {
+                    status,
+                    sequence_number,
+                    ..
+                },
+            ..
+        }) = thread.history.get(*history_index)
+        && status.is_some()
+    {
+        return Some((app.active_thread_idx, *id, *sequence_number));
+    }
+
+    thread.running_assistant_id.map(|assistant_id| {
+        let sequence_number = thread
+            .history
+            .iter()
+            .find(|item| item.id == assistant_id)
+            .and_then(|item| match &item.entry {
+                HistoryEntry::Assistant {
+                    sequence_number, ..
+                } => *sequence_number,
+                _ => None,
+            });
+        (app.active_thread_idx, assistant_id, sequence_number)
+    })
+}
+
+fn cancel_queued_assistant(app: &mut AppState, thread_index: usize, assistant_id: u64) {
+    let thread = &mut app.threads[thread_index];
+    thread
+        .queue
+        .retain(|job| job.assistant_entry_id != assistant_id);
+    if let Some(index) = find_history_index(thread, assistant_id) {
+        thread.history.remove(index);
+    }
 }
 
 fn close_command_mode(app: &mut AppState) {
@@ -1861,9 +2120,7 @@ fn push_notice_current(app: &mut AppState, message: String) {
 
 fn selection_edit_action(entry: &HistoryEntry) -> Option<SelectionEditAction> {
     match entry {
-        HistoryEntry::Assistant { prompt, .. } => {
-            Some(SelectionEditAction::Prompt(prompt.clone()))
-        }
+        HistoryEntry::Assistant { prompt, .. } => Some(SelectionEditAction::Prompt(prompt.clone())),
         HistoryEntry::Command { raw, .. } => Some(SelectionEditAction::Command(raw.clone())),
         HistoryEntry::Break => Some(SelectionEditAction::Command(String::from("break"))),
         HistoryEntry::LoadingModel { .. } => None,
@@ -2060,6 +2317,15 @@ fn default_tools() -> Vec<ToolSpec> {
             ],
         ),
         ToolSpec::new(
+            "list_files",
+            "Lists files in the target directory.",
+            vec![ToolParameter::optional(
+                "path",
+                "The project-relative directory to list files or directories for.",
+                ToolParameterKind::String,
+            )],
+        ),
+        ToolSpec::new(
             "read_file",
             "Read a local project file by relative path.",
             vec![ToolParameter::required(
@@ -2067,22 +2333,6 @@ fn default_tools() -> Vec<ToolSpec> {
                 "The project-relative file path to read.",
                 ToolParameterKind::String,
             )],
-        ),
-        ToolSpec::new(
-            "get_weather",
-            "Get fake weather for a city. This is a test tool and does not call a real API.",
-            vec![
-                ToolParameter::required(
-                    "city",
-                    "The city to get fake weather for.",
-                    ToolParameterKind::String,
-                ),
-                ToolParameter::optional(
-                    "include_forecast",
-                    "Whether to include a fake multi-day forecast.",
-                    ToolParameterKind::Boolean,
-                ),
-            ],
         ),
     ]
 }
@@ -2093,6 +2343,7 @@ impl JobEvent {
             Self::Status { tab_id, .. }
             | Self::Chunk { tab_id, .. }
             | Self::Complete { tab_id, .. }
+            | Self::Interrupted { tab_id, .. }
             | Self::Error { tab_id, .. } => *tab_id,
         }
     }
@@ -2101,6 +2352,21 @@ impl JobEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mdstream::{Block, BlockId, BlockKind, BlockStatus};
+
+    fn text_blocks(text: &str) -> Vec<Block> {
+        if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![Block {
+                id: BlockId(1),
+                status: BlockStatus::Committed,
+                kind: BlockKind::Paragraph,
+                raw: text.to_string(),
+                display: None,
+            }]
+        }
+    }
 
     #[test]
     fn parse_startup_args_accepts_tools_enable_and_disable() {
@@ -2141,8 +2407,10 @@ mod tests {
             scroll_anchor: ScrollAnchor::Bottom,
             queue: VecDeque::new(),
             running_job: false,
+            running_assistant_id: None,
             loaded_models: HashSet::new(),
             connections: HashMap::new(),
+            has_unseen_changes: false,
         };
 
         assert_eq!(
@@ -2186,9 +2454,10 @@ mod tests {
                     entry: HistoryEntry::Assistant {
                         model_id: String::from("qwen3.5"),
                         prompt: String::from("hello"),
-                        content: String::from("reply"),
+                        blocks: text_blocks("reply"),
                         callouts: vec![],
                         status: None,
+                        sequence_number: None,
                     },
                     meta: HistoryMeta::None,
                 },
@@ -2199,8 +2468,10 @@ mod tests {
             scroll_anchor: ScrollAnchor::Bottom,
             queue: VecDeque::new(),
             running_job: false,
+            running_assistant_id: None,
             loaded_models: HashSet::new(),
             connections: HashMap::new(),
+            has_unseen_changes: false,
         };
 
         let config = effective_config_until(&thread, 2);
@@ -2214,9 +2485,10 @@ mod tests {
             selection_edit_action(&HistoryEntry::Assistant {
                 model_id: String::from("m"),
                 prompt: String::from("question"),
-                content: String::from("answer"),
+                blocks: text_blocks("answer"),
                 callouts: vec![],
                 status: None,
+                sequence_number: None,
             }),
             Some(SelectionEditAction::Prompt(value)) if value == "question"
         ));
@@ -2256,9 +2528,10 @@ mod tests {
                     entry: HistoryEntry::Assistant {
                         model_id: String::from("m"),
                         prompt: String::from("first"),
-                        content: String::from("one"),
+                        blocks: text_blocks("one"),
                         callouts: vec![],
                         status: None,
+                        sequence_number: None,
                     },
                     meta: HistoryMeta::None,
                 },
@@ -2267,9 +2540,10 @@ mod tests {
                     entry: HistoryEntry::Assistant {
                         model_id: String::from("m"),
                         prompt: String::from("second"),
-                        content: String::from("two"),
+                        blocks: text_blocks("two"),
                         callouts: vec![],
                         status: None,
+                        sequence_number: None,
                     },
                     meta: HistoryMeta::None,
                 },
@@ -2280,8 +2554,10 @@ mod tests {
             scroll_anchor: ScrollAnchor::Bottom,
             queue: VecDeque::new(),
             running_job: false,
+            running_assistant_id: None,
             loaded_models: HashSet::new(),
             connections: HashMap::new(),
+            has_unseen_changes: false,
         };
         let mut app = AppState {
             threads: vec![thread],
@@ -2326,9 +2602,10 @@ mod tests {
                 entry: HistoryEntry::Assistant {
                     model_id: String::from("m"),
                     prompt: String::from("last"),
-                    content: String::from("done"),
+                    blocks: text_blocks("done"),
                     callouts: vec![],
                     status: None,
+                    sequence_number: None,
                 },
                 meta: HistoryMeta::None,
             }],
@@ -2338,8 +2615,10 @@ mod tests {
             scroll_anchor: ScrollAnchor::Bottom,
             queue: VecDeque::new(),
             running_job: false,
+            running_assistant_id: None,
             loaded_models: HashSet::new(),
             connections: HashMap::new(),
+            has_unseen_changes: false,
         };
         let mut app = AppState {
             threads: vec![thread],
@@ -2381,9 +2660,10 @@ mod tests {
                     entry: HistoryEntry::Assistant {
                         model_id: String::from("m"),
                         prompt: String::from("first"),
-                        content: String::from("one"),
+                        blocks: text_blocks("one"),
                         callouts: vec![],
                         status: None,
+                        sequence_number: None,
                     },
                     meta: HistoryMeta::None,
                 },
@@ -2392,9 +2672,10 @@ mod tests {
                     entry: HistoryEntry::Assistant {
                         model_id: String::from("m"),
                         prompt: String::from("second"),
-                        content: String::from("two"),
+                        blocks: text_blocks("two"),
                         callouts: vec![],
                         status: None,
+                        sequence_number: None,
                     },
                     meta: HistoryMeta::None,
                 },
@@ -2405,8 +2686,10 @@ mod tests {
             scroll_anchor: ScrollAnchor::Bottom,
             queue: VecDeque::new(),
             running_job: false,
+            running_assistant_id: None,
             loaded_models: HashSet::new(),
             connections: HashMap::new(),
+            has_unseen_changes: false,
         };
 
         let mut app = AppState {
@@ -2475,9 +2758,10 @@ mod tests {
                     entry: HistoryEntry::Assistant {
                         model_id: String::from("m"),
                         prompt: String::from("first"),
-                        content: String::from("one"),
+                        blocks: text_blocks("one"),
                         callouts: vec![],
                         status: None,
+                        sequence_number: None,
                     },
                     meta: HistoryMeta::None,
                 },
@@ -2486,9 +2770,10 @@ mod tests {
                     entry: HistoryEntry::Assistant {
                         model_id: String::from("m"),
                         prompt: String::from("second"),
-                        content: String::from("two"),
+                        blocks: text_blocks("two"),
                         callouts: vec![],
                         status: None,
+                        sequence_number: None,
                     },
                     meta: HistoryMeta::None,
                 },
@@ -2499,8 +2784,10 @@ mod tests {
             scroll_anchor: ScrollAnchor::Bottom,
             queue: VecDeque::new(),
             running_job: false,
+            running_assistant_id: None,
             loaded_models: HashSet::new(),
             connections: HashMap::new(),
+            has_unseen_changes: false,
         };
         let mut app = AppState {
             threads: vec![thread],
@@ -2552,8 +2839,10 @@ mod tests {
             scroll_anchor: ScrollAnchor::Bottom,
             queue: VecDeque::new(),
             running_job: false,
+            running_assistant_id: None,
             loaded_models: HashSet::from([String::from("m")]),
             connections: HashMap::new(),
+            has_unseen_changes: false,
         };
 
         normalize_selection(&mut thread);

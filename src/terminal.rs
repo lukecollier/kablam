@@ -1,15 +1,21 @@
 use std::collections::HashMap;
 use std::io;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::{cursor::MoveTo, terminal::ClearType};
+use mdstream::{Block as MarkdownBlock, BlockKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Margin, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Widget, Wrap};
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Style as SyntectStyle, Theme, ThemeSet};
+use syntect::parsing::SyntaxSet;
+use syntect::util::LinesWithEndings;
 
 use crate::command_palette::CommandPaletteView;
 
@@ -18,9 +24,10 @@ pub enum HistoryEntry {
     Assistant {
         model_id: String,
         prompt: String,
-        content: String,
+        blocks: Vec<MarkdownBlock>,
         callouts: Vec<String>,
         status: Option<AssistantStatus>,
+        sequence_number: Option<u64>,
     },
     LoadingModel {
         model_id: String,
@@ -64,6 +71,7 @@ pub enum ScrollAnchor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabRenderInfo {
     pub label: String,
+    pub has_unseen: bool,
 }
 
 pub struct RenderState<'a> {
@@ -145,9 +153,12 @@ pub fn clipboard_text(entries: &[HistoryEntry], index: usize) -> String {
         Some(HistoryEntry::Assistant {
             model_id,
             prompt,
-            content,
+            blocks,
             ..
-        }) => format!("assistant {model_id}:\n{prompt}\n\n{content}"),
+        }) => format!(
+            "assistant {model_id}:\n{prompt}\n\n{}",
+            assistant_blocks_text(blocks)
+        ),
         Some(HistoryEntry::LoadingModel { model_id, status }) => match status {
             Some(ModelLoadStatus::Loading { .. }) => format!("loading model:\n{model_id}"),
             Some(ModelLoadStatus::Loaded) | None => format!("model loaded:\n{model_id}"),
@@ -272,7 +283,13 @@ fn render_screen<T: RenderTarget>(
         after_tabs.width,
         after_tabs.height.saturating_sub(transcript_height),
     );
-    render_footer(target, footer_area, state.mode, state.draft, state.prompt_inline);
+    render_footer(
+        target,
+        footer_area,
+        state.mode,
+        state.draft,
+        state.prompt_inline,
+    );
 
     if let Some(command_palette) = state.command_palette {
         render_command_palette_overlay(target, after_tabs, command_palette);
@@ -362,7 +379,14 @@ fn render_tabs(
 
     let titles = tabs
         .iter()
-        .map(|tab| Line::from(tab.label.clone()))
+        .map(|tab| {
+            let label = if tab.has_unseen {
+                format!("{} *", tab.label)
+            } else {
+                tab.label.clone()
+            };
+            Line::from(label)
+        })
         .collect::<Vec<_>>();
     let tabs = Tabs::new(titles)
         .block(Block::default().borders(Borders::ALL).title("threads"))
@@ -594,6 +618,7 @@ fn render_command_palette_overlay(
         Block::default()
             .borders(Borders::ALL)
             .title("cmd")
+            .bg(Color::Black)
             .border_style(border_style),
         layout.box_area,
     );
@@ -608,7 +633,8 @@ fn render_command_palette_overlay(
 
     if layout.list_area.height > 0 {
         target.render_paragraph(
-            command_suggestions_paragraph(palette.suggestions, palette.highlighted),
+            command_suggestions_paragraph(palette.suggestions, palette.highlighted)
+                .block(Block::default().bg(Color::Black)),
             layout.list_area,
         );
     }
@@ -749,10 +775,11 @@ fn command_suggestions_paragraph(
         let selected = highlighted == Some(index);
         let style = if selected {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Yellow)
+                .bg(Color::Gray)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(Color::White)
         };
         lines.push(Line::from(vec![Span::styled(
             suggestion.display.clone(),
@@ -796,9 +823,10 @@ impl HistoryEntry {
             Self::Assistant {
                 model_id,
                 prompt,
-                content,
+                blocks,
                 callouts,
                 status,
+                ..
             } => {
                 let empty_model_colors = HashMap::new();
                 let model_colors = model_colors.unwrap_or(&empty_model_colors);
@@ -858,11 +886,9 @@ impl HistoryEntry {
                         )]));
                     }
                     None => {
-                        if !content.is_empty() {
+                        if !blocks.is_empty() {
                             lines.push(Line::from(Vec::<Span<'static>>::new()));
-                            lines.extend(content.split('\n').map(|line| {
-                                Line::from(vec![Span::styled(line.to_string(), base_style)])
-                            }));
+                            lines.extend(render_markdown_blocks(blocks, base_style));
                         }
                     }
                 }
@@ -949,6 +975,170 @@ impl HistoryEntry {
         }
         (paragraph, height, cursor)
     }
+}
+
+fn assistant_blocks_text(blocks: &[MarkdownBlock]) -> String {
+    blocks.iter().map(|block| block.raw.as_str()).collect()
+}
+
+fn render_markdown_blocks(blocks: &[MarkdownBlock], base_style: Style) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    for (index, block) in blocks.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::from(Vec::<Span<'static>>::new()));
+        }
+
+        if block.kind == BlockKind::CodeFence {
+            lines.extend(render_code_block(block));
+            continue;
+        }
+
+        let text = block.display_or_raw().trim_end_matches('\n');
+        if text.is_empty() {
+            continue;
+        }
+
+        lines.extend(
+            text.split('\n')
+                .map(|line| Line::from(vec![Span::styled(line.to_string(), base_style)])),
+        );
+    }
+
+    lines
+}
+
+fn render_code_block(block: &MarkdownBlock) -> Vec<Line<'static>> {
+    let body = fenced_code_body(block.display_or_raw());
+    if body.is_empty() {
+        return Vec::new();
+    }
+    let assets = syntax_assets();
+    let mut lines = assets.highlight_codeblock(block);
+    expand_tabs_lines(&mut lines, 2);
+    lines
+}
+
+fn fenced_code_body(text: &str) -> &str {
+    let Some(first_newline) = text.find('\n') else {
+        return "";
+    };
+    let body = &text[first_newline + 1..];
+    match body.rfind("\n```") {
+        Some(index) => &body[..index],
+        None => body,
+    }
+}
+
+fn syntect_style_to_ratatui(style: SyntectStyle) -> Style {
+    Style::default().fg(Color::Rgb(
+        style.foreground.r,
+        style.foreground.g,
+        style.foreground.b,
+    ))
+}
+
+fn expand_tabs_lines(lines: &mut [Line<'_>], tab_width: usize) {
+    for line in lines {
+        let mut col = 0;
+
+        for span in &mut line.spans {
+            span.content = expand_tabs(&span.content, tab_width, &mut col).into();
+        }
+    }
+}
+
+fn expand_tabs(s: &str, tab_width: usize, col: &mut usize) -> String {
+    let mut out = String::new();
+
+    for ch in s.chars() {
+        match ch {
+            '\t' => {
+                let spaces = tab_width - (*col % tab_width);
+                out.push_str(&" ".repeat(spaces));
+                *col += spaces;
+            }
+            '\n' => {
+                out.push('\n');
+                *col = 0;
+            }
+            _ => {
+                out.push(ch);
+                *col += 1;
+            }
+        }
+    }
+
+    out
+}
+
+struct SyntaxAssets {
+    syntaxes: SyntaxSet,
+    theme: Theme,
+}
+
+impl SyntaxAssets {
+    fn highlight_codeblock(&self, raw_code_block: &MarkdownBlock) -> Vec<Line<'static>> {
+        let assets = self;
+        let lang = raw_code_block.code_fence_language().unwrap_or("txt");
+        let Some(ref syntax) = assets
+            .syntaxes
+            .find_syntax_by_extension(lang)
+            .or(assets.syntaxes.find_syntax_by_name(lang))
+        else {
+            return raw_code_block
+                .display_or_raw()
+                .lines()
+                .map(|line| Line::from(vec![Span::raw(line.to_string())]))
+                .collect();
+        };
+
+        let code = fenced_code_body(raw_code_block.display_or_raw());
+        let mut highlighter = HighlightLines::new(&syntax, &assets.theme);
+        let mut lines = Vec::new();
+        for line in LinesWithEndings::from(code) {
+            let trimmed = line.strip_suffix('\n').unwrap_or(line);
+            let ranges = match highlighter.highlight_line(line, &assets.syntaxes) {
+                Ok(ranges) => ranges,
+                Err(_) => {
+                    lines.push(Line::from(vec![Span::raw(trimmed.to_string())]));
+                    continue;
+                }
+            };
+
+            let spans = ranges
+                .into_iter()
+                .filter(|(_, segment)| !segment.is_empty())
+                .map(|(style, segment)| {
+                    Span::styled(
+                        segment.strip_suffix('\n').unwrap_or(segment).to_string(),
+                        syntect_style_to_ratatui(style),
+                    )
+                })
+                .collect::<Vec<_>>();
+            lines.push(Line::from(spans));
+        }
+
+        if code.ends_with('\n') {
+            lines.push(Line::from(Vec::<Span<'static>>::new()));
+        }
+
+        lines
+    }
+}
+
+fn syntax_assets() -> &'static SyntaxAssets {
+    static ASSETS: OnceLock<SyntaxAssets> = OnceLock::new();
+    ASSETS.get_or_init(|| {
+        let syntaxes = SyntaxSet::load_defaults_newlines();
+        let theme = ThemeSet::load_defaults()
+            .themes
+            .remove("base16-ocean.dark")
+            .or_else(|| ThemeSet::load_defaults().themes.into_values().next())
+            .expect("syntect default theme set should include at least one theme");
+
+        SyntaxAssets { syntaxes, theme }
+    })
 }
 
 fn labeled_paragraph(
@@ -1046,7 +1236,12 @@ struct PromptCursor {
 
 fn prompt_paragraph(draft: &str, mode: Mode, area_height: u16) -> Paragraph<'static> {
     let line = Line::from(vec![
-        Span::styled(">", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "> ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(draft.to_string()),
     ]);
     match prompt_box_height(area_height) {
@@ -1164,6 +1359,19 @@ mod tests {
     use ratatui::buffer::Buffer;
 
     #[test]
+    fn can_expand_tabs() {
+        let mut lines = vec![Line::from("\t\t\t")];
+        expand_tabs_lines(&mut lines, 2);
+
+        assert_eq!(lines, vec![Line::from(" ".repeat(6))]);
+
+        let mut lines = vec![Line::from("hello\tworld\t!")];
+        expand_tabs_lines(&mut lines, 1);
+
+        assert_eq!(lines, vec![Line::from("hello world !")]);
+    }
+
+    #[test]
     fn command_palette_overlay_renders_error_box_above_command_box() {
         let area = Rect::new(0, 0, 60, 18);
         let suggestions = vec![crate::command_palette::CommandSuggestion {
@@ -1205,9 +1413,11 @@ mod tests {
                 &[
                     TabRenderInfo {
                         label: String::from("1. smollm2"),
+                        has_unseen: false,
                     },
                     TabRenderInfo {
                         label: String::from("2. qwen"),
+                        has_unseen: false,
                     },
                 ],
                 1,

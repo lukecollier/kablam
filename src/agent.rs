@@ -1,3 +1,4 @@
+use mdstream::{Block, DocumentState, MdStream, Update};
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +154,55 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedMarkdown {
+    pub blocks: Vec<Block>,
+    pub tool_call_detected: bool,
+}
+
+pub struct MarkdownAccumulator {
+    tool_format: ToolFormat,
+    stream: MdStream,
+    document: DocumentState,
+}
+
+impl MarkdownAccumulator {
+    pub fn new(tool_format: ToolFormat) -> Self {
+        Self {
+            tool_format,
+            stream: MdStream::default(),
+            document: DocumentState::new(),
+        }
+    }
+
+    pub fn append(&mut self, chunk: &str) -> ParsedMarkdown {
+        let update = self.stream.append(chunk);
+        self.apply_update(update)
+    }
+
+    pub fn finalize(&mut self) -> ParsedMarkdown {
+        let update = self.stream.finalize();
+        self.apply_update(update)
+    }
+
+    fn apply_update(&mut self, update: Update) -> ParsedMarkdown {
+        self.document.apply(update);
+        let blocks = self.document.blocks().cloned().collect::<Vec<_>>();
+        let tool_call_detected = blocks
+            .iter()
+            .any(|block| !self.tool_format.parse(block.display_or_raw()).is_empty());
+
+        ParsedMarkdown {
+            blocks,
+            tool_call_detected,
+        }
+    }
+}
+
+pub fn blocks_to_raw_text(blocks: &[Block]) -> String {
+    blocks.iter().map(|block| block.raw.as_str()).collect()
+}
+
 fn render_tools_json(tools: &[ToolSpec]) -> String {
     let values = tools.iter().map(ToolSpec::schema).collect::<Vec<_>>();
     serde_json::to_string_pretty(&values).expect("tool schema should serialize")
@@ -209,6 +259,7 @@ fn tool_call_from_value(value: &Value) -> Option<ToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mdstream::BlockKind;
 
     #[test]
     fn smollm_xml_tool_calls_parse_json_payloads() {
@@ -230,5 +281,27 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "search_docs");
         assert_eq!(calls[0].arguments["query"], "qwen tools");
+    }
+
+    #[test]
+    fn markdown_accumulator_streams_blocks_and_detects_tool_calls() {
+        let mut markdown = MarkdownAccumulator::new(ToolFormat::XmlJson);
+        let update = markdown.append(
+            "Hello\n\n```rust\nfn main() {}\n```\n\n<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>",
+        );
+
+        assert!(update.tool_call_detected);
+        assert!(
+            update
+                .blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::CodeFence)
+        );
+
+        let finalized = markdown.finalize();
+        assert!(finalized.tool_call_detected);
+        let raw = blocks_to_raw_text(&finalized.blocks);
+        assert!(raw.contains("```rust\nfn main() {}\n```"));
+        assert!(raw.contains("<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>"));
     }
 }
